@@ -1,3 +1,4 @@
 starknet-py
 aiogram
 aiohttp
+supabase
