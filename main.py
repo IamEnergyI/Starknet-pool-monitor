@@ -1,157 +1,156 @@
+"""FastAPI entry point for the Render web service.
+
+Telegram updates are delivered to ``POST /webhook``.  An external cron service
+calls ``GET /scan`` every 60 seconds.  No polling loop is used.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import logging
 import os
-from datetime import datetime, timedelta, timezone
-from aiohttp import web
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message
-from aiogram.filters import Command
-from starknet_py.net.full_node_client import FullNodeClient
-from starknet_py.hash.selector import get_selector_from_name
-from supabase import create_client, Client
+from contextlib import asynccontextmanager
+from typing import Any
 
-bot_state = {"last_checked_block": 0}
-dp = Dispatcher()
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from telegram import Update
+from telegram.ext import CallbackContext
 
-supabase_url = os.environ.get("SUPABASE_URL")
-supabase_key = os.environ.get("SUPABASE_KEY")
-db: Client = create_client(supabase_url, supabase_key)
+import bot
 
-@dp.message(Command("report"))
-async def send_report(message: Message):
-    report_text = (
-        "<b>Status Report</b>\n"
-        "<i>Monitoring:</i> <code>Active</code>\n"
-        "<i>Last Checked Block:</i> <code>" + str(bot_state["last_checked_block"]) + "</code>"
-    )
-    await message.answer(text=report_text, parse_mode="HTML")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-@dp.message(Command("recent"))
-async def get_recent_tokens(message: Message):
-    command_args = message.text.split()
-    
-    if len(command_args) < 2:
-        error_text = (
-            "<b>Command Error</b>\n"
-            "<i>Reason:</i> <code>Missing timeframe</code>\n"
-            "<i>Usage:</i> <code>/recent 2h</code> or <code>/recent 7d</code>"
-        )
-        await message.answer(text=error_text, parse_mode="HTML")
-        return
-        
-    time_limit = command_args[1]
-    hours_to_subtract = 0
-    
-    if time_limit.endswith("h"):
-        hours_to_subtract = int(time_limit.replace("h", ""))
-    elif time_limit.endswith("d"):
-        hours_to_subtract = int(time_limit.replace("d", "")) * 24
-    else:
-        await message.answer(text="<b>Error:</b> Use 'h' for hours or 'd' for days.", parse_mode="HTML")
-        return
-        
-    target_time = datetime.now(timezone.utc) - timedelta(hours=hours_to_subtract)
-    target_time_iso = target_time.isoformat()
-    
+_scan_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize Telegram and register the webhook while the service runs."""
+
+    telegram_app = await bot.initialize()
+    app.state.telegram_app = telegram_app
+    logger.info("Application startup complete")
+
     try:
-        response = db.table("pools").select("*").gte("created_at", target_time_iso).execute()
-        pools = response.data
-        
-        result_text = f"<b>Recent Pools ({time_limit})</b>\n"
-        result_text += f"<i>Total found:</i> <code>{len(pools)}</code>\n\n"
-        
-        for pool in pools[-5:]: 
-            result_text += f"<i>Block:</i> <code>{pool['block_number']}</code>\n"
-            result_text += f"<i>Transaction:</i> <code>{pool['transaction_hash']}</code>\n\n"
-            
-        await message.answer(text=result_text, parse_mode="HTML")
-    except Exception as error:
-        await message.answer(text=f"<b>Database Error:</b> {error}", parse_mode="HTML")
+        yield
+    finally:
+        await bot.shutdown()
+        logger.info("Application shutdown complete")
 
-async def monitor_factory_events(bot: Bot, chat_id: str, rpc_url: str):
-    client = FullNodeClient(node_url=rpc_url)
-    
-    pool_created_key = get_selector_from_name("PoolCreated") 
-    initialize_key = get_selector_from_name("Initialize") 
-    pool_key_event = get_selector_from_name("PoolKey") 
 
-    bot_state["last_checked_block"] = await client.get_block_number()
-    print(f"Monitoring started at block: {bot_state['last_checked_block']}")
+app = FastAPI(
+    title="Crypto Scanner Bot",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
-    startup_text = (
-        "<b>Starknet Monitor Active</b>\n"
-        "<i>Mode:</i> <code>Global Network Scanner</code>\n"
-        "<i>Current Block:</i> <code>" + str(bot_state['last_checked_block']) + "</code>\n"
-        "<i>Status:</i> <code>Connected to RPC and Database</code>"
-    )
-    await bot.send_message(chat_id=chat_id, text=startup_text, parse_mode="HTML")
 
-    while True:
+def _telegram_application(request: Request) -> Any:
+    telegram_app = getattr(request.app.state, "telegram_app", None)
+    if telegram_app is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Telegram application is not initialized",
+        )
+    return telegram_app
+
+
+@app.get("/")
+async def health_check() -> dict[str, str]:
+    return {"status": "Bot is running"}
+
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request) -> dict[str, bool]:
+    """Receive one Telegram update through the webhook."""
+
+    telegram_app = _telegram_application(request)
+
+    try:
+        payload = await request.json()
+    except Exception as exc:  # noqa: BLE001 - malformed client payload
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON body",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Telegram update must be a JSON object",
+        )
+
+    try:
+        update = Update.de_json(payload, telegram_app.bot)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not deserialize Telegram update: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Telegram update",
+        ) from exc
+
+    if update is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Empty Telegram update",
+        )
+
+    try:
+        await telegram_app.process_update(update)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to process Telegram update")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process update",
+        ) from exc
+
+    return {"ok": True}
+
+
+@app.get("/scan")
+async def scan(request: Request) -> dict[str, Any]:
+    """Cron endpoint: run one scan across every active user's filter."""
+
+    telegram_app = _telegram_application(request)
+
+    # Render's cron can overlap if a scan runs longer than 60 seconds.  Do not
+    # queue duplicate scans; report a successful no-op instead.
+    if _scan_lock.locked():
+        logger.warning("Scan request skipped because a scan is already running")
+        return {
+            "status": "success",
+            "skipped": True,
+            "reason": "scan already in progress",
+        }
+
+    async with _scan_lock:
         try:
-            current_block = await client.get_block_number()
+            # A generic context is sufficient: trigger_scan only needs context.bot.
+            context = CallbackContext(application=telegram_app)
+            stats = await bot.trigger_scan(context)
+        except Exception:  # noqa: BLE001
+            logger.exception("Scheduled scan failed")
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={
+                    "status": "error",
+                    "detail": "Scan failed; check server logs.",
+                },
+            )
 
-            if current_block > bot_state["last_checked_block"]:
-                events_response = await client.get_events(
-                    address=None,
-                    keys=[[pool_created_key, initialize_key, pool_key_event]],
-                    from_block_number=bot_state["last_checked_block"] + 1,
-                    to_block_number=current_block,
-                    chunk_size=100
-                )
+    return {"status": "success", **stats}
 
-                for event in events_response.events:
-                    tx_hash = hex(event.transaction_hash)
-                    contract_addr = hex(event.from_address)
-                    
-                    db.table("pools").insert({
-                        "block_number": event.block_number,
-                        "transaction_hash": tx_hash
-                    }).execute()
-                    
-                    pool_text = (
-                        "<b>New Starknet Pool Detected</b>\n"
-                        "<i>DEX Address:</i> <code>" + contract_addr + "</code>\n"
-                        "<i>Block:</i> <code>" + str(event.block_number) + "</code>\n"
-                        "<i>Transaction:</i> <code>" + tx_hash + "</code>"
-                    )
-                    await bot.send_message(chat_id=chat_id, text=pool_text, parse_mode="HTML")
-
-                bot_state["last_checked_block"] = current_block
-
-            await asyncio.sleep(15)
-
-        except Exception as error:
-            print(f"Error during polling: {error}")
-            await asyncio.sleep(15)
-
-async def handle_health_check(request):
-    return web.Response(text="Bot is running.")
-
-async def start_web_server():
-    app = web.Application()
-    app.add_routes([web.get('/', handle_health_check)])
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"Web server started on port {port}")
-
-async def main():
-    bot_token = os.getenv("BOT_TOKEN")
-    chat_id = os.getenv("CHAT_ID")
-    rpc_url = os.getenv("STARKNET_RPC_URL")
-
-    if not bot_token or not chat_id or not rpc_url:
-        raise ValueError("Environment variables are missing.")
-
-    bot = Bot(token=bot_token)
-
-    await asyncio.gather(
-        start_web_server(),
-        monitor_factory_events(bot, chat_id, rpc_url),
-        dp.start_polling(bot)
-    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "8000")),
+        log_level="info",
+    )
