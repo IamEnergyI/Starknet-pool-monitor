@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -326,8 +327,62 @@ async def get_all_active_users() -> list[dict[str, Any]]:
     return joined
 
 
-async def is_token_recently_sent(token_address: str) -> bool:
-    """Return ``True`` if the token was sent within the last 72 hours."""
+class PaperTradingError(Exception):
+    """A user-facing paper-trading failure."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+_RPC_ERROR_MESSAGES = {
+    "invalid_amount": "Enter an amount between $1 and $1,000,000.",
+    "invalid_price": "A valid current token price is required.",
+    "invalid_fee_rate": "The paper fee configuration is invalid.",
+    "invalid_slippage": "The paper slippage configuration is invalid.",
+    "invalid_fraction": "Choose a sell amount between 1% and 100%.",
+    "alert_not_found": "That alert is no longer available.",
+    "alert_expired": "That alert has expired. Buy buttons are valid for 1 hour.",
+    "account_not_found": "Paper account not found. Open /portfolio first.",
+    "insufficient_funds": "Not enough paper cash for that buy.",
+    "position_not_found": "That paper position is no longer open.",
+    "trading_started": (
+        "Trading has already started. Use /resetpaper to start over with "
+        "a new balance."
+    ),
+}
+
+
+def _translate_rpc_error(exc: Exception) -> None:
+    text = str(exc).lower()
+    for code, message in _RPC_ERROR_MESSAGES.items():
+        if code in text:
+            raise PaperTradingError(code, message) from exc
+    raise exc
+
+
+async def _rpc(function_name: str, params: dict[str, Any]) -> dict[str, Any]:
+    try:
+        response = await _execute(get_supabase().rpc(function_name, params))
+    except Exception as exc:  # noqa: BLE001 - translated into domain errors
+        _translate_rpc_error(exc)
+        raise
+
+    data = getattr(response, "data", None)
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if isinstance(data, dict):
+        return data
+    if data is None:
+        return {}
+    return {"value": data}
+
+
+async def is_token_recently_sent(
+    telegram_id: int, token_address: str
+) -> bool:
+    """Return ``True`` if this user was sent the token in the last 72 hours."""
 
     token_address = (token_address or "").strip()
     if not token_address:
@@ -338,6 +393,7 @@ async def is_token_recently_sent(token_address: str) -> bool:
         get_supabase()
         .table("sent_tokens")
         .select("token_address")
+        .eq("telegram_id", int(telegram_id))
         .eq("token_address", token_address)
         .gte("sent_at", cutoff)
         .limit(1)
@@ -346,9 +402,11 @@ async def is_token_recently_sent(token_address: str) -> bool:
 
 
 async def mark_token_as_sent(
-    token_address: str, chain_id: str
+    telegram_id: int,
+    token_address: str,
+    chain_id: str,
 ) -> dict[str, Any] | None:
-    """Insert or refresh the send timestamp for a token."""
+    """Insert or refresh this user's send timestamp for a token."""
 
     token_address = (token_address or "").strip()
     chain_id = (chain_id or "").strip()
@@ -356,6 +414,7 @@ async def mark_token_as_sent(
         raise ValueError("token_address cannot be empty")
 
     payload = {
+        "telegram_id": int(telegram_id),
         "token_address": token_address,
         "chain_id": chain_id,
         "sent_at": datetime.now(timezone.utc).isoformat(),
@@ -363,7 +422,230 @@ async def mark_token_as_sent(
     response = await _execute(
         get_supabase()
         .table("sent_tokens")
-        .upsert(payload, on_conflict="token_address")
+        .upsert(
+            payload,
+            on_conflict="telegram_id,token_address",
+        )
     )
     rows = _response_rows(response)
     return rows[0] if rows else None
+
+
+# ---------------------------------------------------------------------------
+# Paper-trading persistence
+# ---------------------------------------------------------------------------
+
+
+async def get_or_create_paper_account(
+    telegram_id: int,
+    starting_balance: float = 1000.0,
+) -> dict[str, Any]:
+    """Create the user's fake account on first use and return it."""
+
+    return await _rpc(
+        "paper_get_or_create_account",
+        {
+            "p_telegram_id": int(telegram_id),
+            "p_starting_balance": float(starting_balance),
+        },
+    )
+
+
+async def get_paper_account(telegram_id: int) -> dict[str, Any] | None:
+    response = await _execute(
+        get_supabase()
+        .table("paper_accounts")
+        .select("*")
+        .eq("telegram_id", int(telegram_id))
+        .limit(1)
+    )
+    rows = _response_rows(response)
+    return rows[0] if rows else None
+
+
+async def set_paper_balance(
+    telegram_id: int,
+    balance: float,
+) -> dict[str, Any]:
+    return await _rpc(
+        "paper_set_balance",
+        {
+            "p_telegram_id": int(telegram_id),
+            "p_balance": float(balance),
+        },
+    )
+
+
+async def add_paper_funds(
+    telegram_id: int,
+    amount: float,
+) -> dict[str, Any]:
+    return await _rpc(
+        "paper_add_funds",
+        {
+            "p_telegram_id": int(telegram_id),
+            "p_amount": float(amount),
+        },
+    )
+
+
+async def reset_paper_account(
+    telegram_id: int,
+    balance: float = 1000.0,
+) -> dict[str, Any]:
+    return await _rpc(
+        "paper_reset",
+        {
+            "p_telegram_id": int(telegram_id),
+            "p_balance": float(balance),
+        },
+    )
+
+
+async def create_paper_alert(
+    telegram_id: int,
+    filter_id: str | None,
+    pair: dict[str, Any],
+    warning: str | None,
+) -> dict[str, Any] | None:
+    """Persist an alert so its buy buttons can reference a short id."""
+
+    base_token = pair.get("baseToken")
+    if not isinstance(base_token, dict):
+        base_token = {}
+
+    try:
+        price_usd = float(pair.get("priceUsd"))
+    except (TypeError, ValueError):
+        price_usd = None
+    if price_usd is not None and not math.isfinite(price_usd):
+        price_usd = None
+
+    payload = {
+        "telegram_id": int(telegram_id),
+        "filter_id": str(filter_id) if filter_id else None,
+        "token_address": str(
+            base_token.get("address") or pair.get("pairAddress") or ""
+        ).strip(),
+        "chain_id": str(pair.get("chainId") or "").strip(),
+        "pair_address": str(pair.get("pairAddress") or "").strip(),
+        "symbol": (base_token.get("symbol") or None),
+        "name": (base_token.get("name") or None),
+        "price_usd": price_usd,
+        "warning": warning,
+    }
+    if not payload["token_address"] or not payload["pair_address"]:
+        logger.warning("Not creating paper alert without token/pair address")
+        return None
+
+    response = await _execute(
+        get_supabase().table("paper_alerts").insert(payload)
+    )
+    rows = _response_rows(response)
+    return rows[0] if rows else None
+
+
+async def get_paper_alert(
+    alert_id: int,
+    telegram_id: int,
+) -> dict[str, Any] | None:
+    response = await _execute(
+        get_supabase()
+        .table("paper_alerts")
+        .select("*")
+        .eq("id", int(alert_id))
+        .eq("telegram_id", int(telegram_id))
+        .limit(1)
+    )
+    rows = _response_rows(response)
+    return rows[0] if rows else None
+
+
+async def get_paper_positions(
+    telegram_id: int,
+    status: str | None = "open",
+) -> list[dict[str, Any]]:
+    query = (
+        get_supabase()
+        .table("paper_positions")
+        .select("*")
+        .eq("telegram_id", int(telegram_id))
+        .order("opened_at", desc=True)
+    )
+    if status:
+        query = query.eq("status", status)
+
+    return _response_rows(await _execute(query))
+
+
+async def get_paper_position(
+    position_id: str,
+    telegram_id: int,
+) -> dict[str, Any] | None:
+    response = await _execute(
+        get_supabase()
+        .table("paper_positions")
+        .select("*")
+        .eq("id", str(position_id))
+        .eq("telegram_id", int(telegram_id))
+        .limit(1)
+    )
+    rows = _response_rows(response)
+    return rows[0] if rows else None
+
+
+async def get_paper_fills(
+    telegram_id: int,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    response = await _execute(
+        get_supabase()
+        .table("paper_fills")
+        .select("*")
+        .eq("telegram_id", int(telegram_id))
+        .order("created_at", desc=True)
+        .limit(max(1, min(int(limit), 100)))
+    )
+    return _response_rows(response)
+
+
+async def execute_paper_buy(
+    telegram_id: int,
+    alert_id: int,
+    amount_usd: float,
+    market_price: float,
+    fee_rate: float,
+    slippage_bps: int,
+) -> dict[str, Any]:
+    return await _rpc(
+        "paper_buy",
+        {
+            "p_telegram_id": int(telegram_id),
+            "p_alert_id": int(alert_id),
+            "p_amount_usd": float(amount_usd),
+            "p_market_price": float(market_price),
+            "p_fee_rate": float(fee_rate),
+            "p_slippage_bps": int(slippage_bps),
+        },
+    )
+
+
+async def execute_paper_sell(
+    telegram_id: int,
+    position_id: str,
+    fraction: float,
+    market_price: float,
+    fee_rate: float,
+    slippage_bps: int,
+) -> dict[str, Any]:
+    return await _rpc(
+        "paper_sell",
+        {
+            "p_telegram_id": int(telegram_id),
+            "p_position_id": str(position_id),
+            "p_fraction": float(fraction),
+            "p_market_price": float(market_price),
+            "p_fee_rate": float(fee_rate),
+            "p_slippage_bps": int(slippage_bps),
+        },
+    )

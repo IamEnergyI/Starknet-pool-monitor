@@ -7,6 +7,7 @@ import math
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from telegram import (
@@ -27,7 +28,7 @@ from telegram.ext import (
 )
 
 import database as db
-from scanner import scan_dexscreener
+from scanner import fetch_current_prices, fetch_pair_price, scan_dexscreener
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +48,47 @@ def _parse_allowed_users(raw: str) -> set[int]:
 
 ALLOWED_USERS = _parse_allowed_users(os.environ.get("ALLOWED_USERS", ""))
 
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r", name, raw)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r", name, raw)
+        return default
+
+
+PAPER_MAX_AMOUNT = 1_000_000.0
+PAPER_STARTING_BALANCE = min(
+    PAPER_MAX_AMOUNT, max(1.0, _env_float("PAPER_STARTING_BALANCE", 1000.0))
+)
+PAPER_FEE_RATE = min(0.5, max(0.0, _env_float("PAPER_FEE_RATE", 0.005)))
+PAPER_SLIPPAGE_BPS = min(
+    5000, max(0, _env_int("PAPER_SLIPPAGE_BPS", 200))
+)
+PAPER_BUY_PRESETS = (25.0, 50.0, 100.0)
+
 # user_id -> {"field": "<filters column>"}
 WAITING_FOR_VALUE: dict[int, dict[str, Any]] = {}
+
+# user_id -> {"action": "paper_buy"|"paper_sell"|"addfunds"|"setbalance", ...}
+WAITING_FOR_PAPER_VALUE: dict[int, dict[str, Any]] = {}
+
+# user_id -> requested reset balance awaiting confirmation
+PENDING_PAPER_RESET: dict[int, float] = {}
 
 TIMEFRAMES = ("5M", "1H", "6H", "24H")
 
@@ -166,6 +206,12 @@ def _build_application() -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("filter", filter_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("portfolio", portfolio_command))
+    application.add_handler(CommandHandler("paper", portfolio_command))
+    application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("addfunds", add_funds_command))
+    application.add_handler(CommandHandler("setbalance", set_balance_command))
+    application.add_handler(CommandHandler("resetpaper", reset_paper_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_waiting_value)
@@ -210,7 +256,13 @@ async def initialize() -> Application:
             [
                 BotCommand("start", "Start the bot"),
                 BotCommand("filter", "Configure token filters"),
-                BotCommand("cancel", "Cancel a pending edit"),
+                BotCommand("portfolio", "Paper portfolio and PnL"),
+                BotCommand("paper", "Alias for /portfolio"),
+                BotCommand("history", "Paper trade history"),
+                BotCommand("addfunds", "Add fake paper funds"),
+                BotCommand("setbalance", "Set starting paper balance"),
+                BotCommand("resetpaper", "Reset paper account"),
+                BotCommand("cancel", "Cancel a pending action"),
             ]
         )
     except TelegramError:
@@ -334,6 +386,78 @@ def _format_age(pair: dict[str, Any]) -> str:
 def _chain_display(chain: Any) -> str:
     raw = str(chain)
     return CHAIN_LABELS.get(raw.lower(), raw)
+
+
+def _format_price(value: Any) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "N/A"
+    if number >= 1:
+        return f"${number:,.4f}"
+    if number >= 0.01:
+        return f"${number:.6f}"
+    return f"${number:.10f}".rstrip("0").rstrip(".")
+
+
+def _format_quantity(value: Any) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "N/A"
+    if abs(number) >= 1_000_000:
+        return f"{number:,.0f}"
+    if abs(number) >= 1_000:
+        return f"{number:,.2f}"
+    return f"{number:,.6f}".rstrip("0").rstrip(".")
+
+
+def _format_pct(value: Any) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "N/A"
+    return f"{number:+.2f}%"
+
+
+def _format_when(value: Any) -> str:
+    if not value:
+        return "Unknown"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _parse_usd_amount(
+    raw: str,
+    *,
+    minimum: float = 1.0,
+    maximum: float = PAPER_MAX_AMOUNT,
+) -> tuple[float | None, str | None]:
+    cleaned = (
+        raw.replace(",", "").replace("$", "").lower().replace("usd", "").strip()
+    )
+    if not cleaned:
+        return None, "Enter a dollar amount."
+    try:
+        amount = round(float(cleaned), 2)
+    except ValueError:
+        return None, "That is not a valid dollar amount."
+    if not math.isfinite(amount):
+        return None, "The amount must be finite."
+    if amount < minimum:
+        return None, f"The minimum amount is ${minimum:,.2f}."
+    if amount > maximum:
+        return None, f"The maximum amount is ${maximum:,.2f}."
+    return amount, None
+
+
+def _price_key(chain_id: Any, pair_address: Any) -> tuple[str, str]:
+    return (
+        str(chain_id or "").strip().lower(),
+        str(pair_address or "").strip().lower(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +721,864 @@ async def _get_or_create_filter(telegram_id: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Paper-trading helpers
+# ---------------------------------------------------------------------------
+
+
+async def _ensure_paper_account(telegram_id: int) -> dict[str, Any]:
+    await db.ensure_user(telegram_id)
+    return await db.get_or_create_paper_account(
+        telegram_id, PAPER_STARTING_BALANCE
+    )
+
+
+def _account_float(account: dict[str, Any], key: str) -> float:
+    return _coerce_float(account.get(key)) or 0.0
+
+
+async def _build_portfolio(telegram_id: int) -> dict[str, Any]:
+    account = await _ensure_paper_account(telegram_id)
+    all_positions = await db.get_paper_positions(telegram_id, status=None)
+    open_positions = [
+        position
+        for position in all_positions
+        if position.get("status") == "open"
+        and (_coerce_float(position.get("quantity")) or 0.0) > 0
+    ]
+
+    requests = [
+        (
+            str(position.get("token_address") or ""),
+            str(position.get("chain_id") or ""),
+            str(position.get("pair_address") or ""),
+        )
+        for position in open_positions
+    ]
+    prices = await fetch_current_prices(requests) if requests else {}
+
+    priced_positions: list[dict[str, Any]] = []
+    positions_value = 0.0
+    unrealized_total = 0.0
+    any_stale = False
+
+    for position in open_positions:
+        quantity = _coerce_float(position.get("quantity")) or 0.0
+        cost_basis = _coerce_float(position.get("cost_basis_usd")) or 0.0
+        entry_price = _coerce_float(position.get("avg_entry_price")) or 0.0
+
+        key = _price_key(
+            position.get("chain_id"), position.get("pair_address")
+        )
+        live_price = prices.get(key)
+        last_price = _coerce_float(position.get("last_price_usd"))
+        current_price = live_price if live_price is not None else last_price
+        stale = live_price is None
+        any_stale = any_stale or stale
+
+        market_value: float | None = None
+        unrealized: float | None = None
+        unrealized_pct: float | None = None
+        if current_price is not None:
+            market_value = quantity * current_price
+            unrealized = market_value - cost_basis
+            if cost_basis > 0:
+                unrealized_pct = (unrealized / cost_basis) * 100.0
+            positions_value += market_value
+            unrealized_total += unrealized
+
+        priced_positions.append(
+            {
+                **position,
+                "quantity": quantity,
+                "cost_basis_usd": cost_basis,
+                "avg_entry_price": entry_price,
+                "current_price": current_price,
+                "market_value": market_value,
+                "unrealized_pnl_usd": unrealized,
+                "unrealized_pct": unrealized_pct,
+                "price_is_stale": stale,
+            }
+        )
+
+    cash = _account_float(account, "cash_balance")
+    total_deposited = _account_float(account, "total_deposited")
+    realized = sum(
+        _coerce_float(position.get("realized_pnl_usd")) or 0.0
+        for position in all_positions
+    )
+    equity = cash + positions_value
+    net_pnl = equity - total_deposited
+    net_pct = (net_pnl / total_deposited * 100.0) if total_deposited > 0 else 0.0
+
+    return {
+        "account": account,
+        "all_positions": all_positions,
+        "open_positions": priced_positions,
+        "cash": cash,
+        "positions_value": positions_value,
+        "equity": equity,
+        "total_deposited": total_deposited,
+        "realized": realized,
+        "unrealized": unrealized_total,
+        "net_pnl": net_pnl,
+        "net_pct": net_pct,
+        "stale_prices": any_stale,
+    }
+
+
+PORTFOLIO_PAGE_SIZE = 8
+
+
+def _portfolio_page(
+    snapshot: dict[str, Any], page: int
+) -> tuple[int, int, list[dict[str, Any]]]:
+    total = len(snapshot["open_positions"])
+    pages = max(1, (total + PORTFOLIO_PAGE_SIZE - 1) // PORTFOLIO_PAGE_SIZE)
+    page = max(0, min(int(page), pages - 1))
+    start = page * PORTFOLIO_PAGE_SIZE
+    return page, pages, snapshot["open_positions"][start : start + PORTFOLIO_PAGE_SIZE]
+
+
+def _portfolio_text(snapshot: dict[str, Any], page: int = 0) -> str:
+    lines = [
+        "💼 Paper Portfolio",
+        "",
+        f"Cash: {_format_money(snapshot['cash'])}",
+        f"Positions: {_format_money(snapshot['positions_value'])}",
+        f"Equity: {_format_money(snapshot['equity'])}",
+        f"Deposited: {_format_money(snapshot['total_deposited'])}",
+        (
+            f"Net P&L: {_format_money(snapshot['net_pnl'])} "
+            f"({_format_pct(snapshot['net_pct'])})"
+        ),
+        f"Realized: {_format_money(snapshot['realized'])}",
+        f"Unrealized: {_format_money(snapshot['unrealized'])}",
+    ]
+
+    if snapshot["stale_prices"]:
+        lines.append("⚠️ Some prices could not be refreshed; last known price used.")
+
+    if not snapshot["open_positions"]:
+        lines.extend(["", "No open paper positions."])
+        return "\n".join(lines)
+
+    page, pages, positions = _portfolio_page(snapshot, page)
+    if pages > 1:
+        lines.append(f"Page {page + 1}/{pages}")
+
+    lines.extend(["", "Open positions"])
+    for position in positions:
+        symbol = _clean_text(
+            position.get("symbol")
+            or position.get("name")
+            or position.get("token_address"),
+            20,
+        )
+        chain = _chain_display(position.get("chain_id"))
+        current_price = _format_price(position.get("current_price"))
+        pnl = _format_money(position.get("unrealized_pnl_usd"))
+        pct = _format_pct(position.get("unrealized_pct"))
+        lines.extend(
+            [
+                f"• {symbol} · {chain}",
+                (
+                    f"  {_format_quantity(position.get('quantity'))} @ "
+                    f"{_format_price(position.get('avg_entry_price'))}"
+                ),
+                f"  Now {current_price} · {pnl} ({pct})",
+            ]
+        )
+
+    lines.extend(["", "Tap a position below to sell part or all of it."])
+    return "\n".join(lines)
+
+
+def _portfolio_keyboard(
+    snapshot: dict[str, Any], page: int = 0
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    page, pages, positions = _portfolio_page(snapshot, page)
+
+    for position in positions:
+        symbol = _clean_text(
+            position.get("symbol")
+            or position.get("name")
+            or position.get("token_address"),
+            14,
+        )
+        pct = _format_pct(position.get("unrealized_pct"))
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{symbol}  {pct}",
+                    callback_data=f"paper:pos:{position['id']}",
+                )
+            ]
+        )
+
+    if pages > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if page > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    "⬅️ Previous", callback_data=f"paper:page:{page - 1}"
+                )
+            )
+        if page + 1 < pages:
+            navigation.append(
+                InlineKeyboardButton(
+                    "Next ➡️", callback_data=f"paper:page:{page + 1}"
+                )
+            )
+        if navigation:
+            rows.append(navigation)
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🔄 Refresh", callback_data=f"pf:refresh:{page}"
+            ),
+            InlineKeyboardButton("➕ Add funds", callback_data="paper:addfunds"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("🕘 History", callback_data="paper:history"),
+            InlineKeyboardButton("♻️ Reset", callback_data="paper:reset"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _position_text(position: dict[str, Any], current_price: float | None) -> str:
+    quantity = _coerce_float(position.get("quantity")) or 0.0
+    cost_basis = _coerce_float(position.get("cost_basis_usd")) or 0.0
+    entry = _coerce_float(position.get("avg_entry_price")) or 0.0
+    current = current_price
+    if current is None:
+        current = _coerce_float(position.get("last_price_usd"))
+
+    market_value = quantity * current if current is not None else None
+    unrealized = (
+        market_value - cost_basis if market_value is not None else None
+    )
+    unrealized_pct = (
+        (unrealized / cost_basis * 100.0)
+        if unrealized is not None and cost_basis > 0
+        else None
+    )
+
+    symbol = _clean_text(
+        position.get("symbol") or position.get("name") or "Token", 30
+    )
+    lines = [
+        f"📊 {symbol}",
+        "",
+        f"Chain: {_chain_display(position.get('chain_id'))}",
+        f"Quantity: {_format_quantity(quantity)}",
+        f"Average entry: {_format_price(entry)}",
+        f"Current price: {_format_price(current)}",
+        f"Cost basis: {_format_money(cost_basis)}",
+        f"Market value: {_format_money(market_value)}",
+        (
+            f"Unrealized P&L: {_format_money(unrealized)} "
+            f"({_format_pct(unrealized_pct)})"
+        ),
+        f"Realized P&L: {_format_money(position.get('realized_pnl_usd'))}",
+        f"Opened: {_format_when(position.get('opened_at'))}",
+        "",
+        "Sell 25%, 50%, 100%, or a custom percentage.",
+    ]
+    if current_price is None:
+        lines.append("⚠️ Live price unavailable; last known price used.")
+    return "\n".join(lines)
+
+
+def _position_keyboard(position: dict[str, Any]) -> InlineKeyboardMarkup:
+    position_id = str(position.get("id"))
+    rows = [
+        [
+            InlineKeyboardButton(
+                "Sell 25%", callback_data=f"ps:{position_id}:25"
+            ),
+            InlineKeyboardButton(
+                "Sell 50%", callback_data=f"ps:{position_id}:50"
+            ),
+            InlineKeyboardButton(
+                "Sell 100%", callback_data=f"ps:{position_id}:100"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "Custom %", callback_data=f"ps:{position_id}:custom"
+            )
+        ],
+    ]
+
+    pair_address = str(position.get("pair_address") or "").strip()
+    chain_id = str(position.get("chain_id") or "").strip()
+    if pair_address and chain_id:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📈 DexScreener",
+                    url=f"https://dexscreener.com/{chain_id}/{pair_address}",
+                )
+            ]
+        )
+
+    rows.append(
+        [InlineKeyboardButton("« Portfolio", callback_data="paper:portfolio")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+async def _history_text(telegram_id: int) -> str:
+    fills = await db.get_paper_fills(telegram_id, limit=20)
+    if not fills:
+        return "🧾 Paper Trade History\n\nNo paper trades yet."
+
+    lines = ["🧾 Paper Trade History", ""]
+    for fill in fills:
+        side = str(fill.get("side") or "").upper()
+        symbol = _clean_text(fill.get("symbol") or "Token", 18)
+        quantity = _format_quantity(fill.get("quantity"))
+        price = _format_price(fill.get("price_usd"))
+        amount = _format_money(fill.get("cash_amount_usd"))
+        when = _format_when(fill.get("created_at"))
+
+        line = f"• {when} · {side} {symbol} · {quantity} @ {price} · {amount}"
+        if side == "SELL":
+            realized = _coerce_float(fill.get("realized_pnl_usd")) or 0.0
+            line += f" · P&L {_format_money(realized)}"
+        lines.append(line)
+
+    lines.extend(["", "Paper trades only — no real funds were used."])
+    return "\n".join(lines)
+
+
+async def _show_portfolio_message(
+    message: Any, telegram_id: int, page: int = 0
+) -> None:
+    snapshot = await _build_portfolio(telegram_id)
+    await message.reply_text(
+        _portfolio_text(snapshot, page),
+        reply_markup=_portfolio_keyboard(snapshot, page),
+    )
+
+
+async def _edit_portfolio(
+    query: Any, telegram_id: int, page: int = 0
+) -> None:
+    snapshot = await _build_portfolio(telegram_id)
+    await _safe_edit(
+        query,
+        _portfolio_text(snapshot, page),
+        _portfolio_keyboard(snapshot, page),
+    )
+
+
+def _paper_error_text(exc: Exception) -> str:
+    if isinstance(exc, db.PaperTradingError):
+        return exc.message
+    logger.exception("Unexpected paper-trading error")
+    return "⚠️ The paper trade could not be completed. Please try again."
+
+
+async def _execute_paper_buy(
+    context: ContextTypes.DEFAULT_TYPE,
+    telegram_id: int,
+    alert_id: int,
+    amount: float,
+) -> None:
+    alert = await db.get_paper_alert(alert_id, telegram_id)
+    if alert is None:
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text="⚠️ That alert is no longer available.",
+        )
+        return
+
+    price = await fetch_pair_price(
+        str(alert.get("token_address") or ""),
+        str(alert.get("chain_id") or ""),
+        str(alert.get("pair_address") or ""),
+    )
+    stale = price is None
+    if price is None:
+        price = _coerce_float(alert.get("price_usd"))
+    if price is None or price <= 0:
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text="⚠️ I could not get a valid price for this token. Try again shortly.",
+        )
+        return
+
+    try:
+        await _ensure_paper_account(telegram_id)
+        fill = await db.execute_paper_buy(
+            telegram_id,
+            alert_id,
+            amount,
+            price,
+            PAPER_FEE_RATE,
+            PAPER_SLIPPAGE_BPS,
+        )
+    except Exception as exc:  # noqa: BLE001 - user-facing failure
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text=_paper_error_text(exc),
+        )
+        return
+
+    symbol = _clean_text(fill.get("symbol") or alert.get("symbol") or "Token", 30)
+    text = (
+        f"✅ Paper buy filled: {symbol}\n\n"
+        f"Spent: {_format_money(fill.get('cash_amount_usd'))}\n"
+        f"Fee: {_format_money(fill.get('fee_usd'))}\n"
+        f"Average fill price: {_format_price(fill.get('price_usd'))}\n"
+        f"Quantity: {_format_quantity(fill.get('quantity'))}\n"
+        f"Cash left: {_format_money(fill.get('cash_balance'))}"
+    )
+    if stale:
+        text += "\n\n⚠️ Live price was unavailable; the alert price was used."
+
+    await context.bot.send_message(
+        chat_id=telegram_id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "💼 View portfolio", callback_data="paper:portfolio"
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+async def _execute_paper_sell(
+    context: ContextTypes.DEFAULT_TYPE,
+    telegram_id: int,
+    position_id: str,
+    fraction: float,
+) -> None:
+    position = await db.get_paper_position(position_id, telegram_id)
+    if (
+        position is None
+        or position.get("status") != "open"
+        or (_coerce_float(position.get("quantity")) or 0.0) <= 0
+    ):
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text="⚠️ That paper position is no longer open.",
+        )
+        return
+
+    price = await fetch_pair_price(
+        str(position.get("token_address") or ""),
+        str(position.get("chain_id") or ""),
+        str(position.get("pair_address") or ""),
+    )
+    stale = price is None
+    if price is None:
+        price = _coerce_float(position.get("last_price_usd"))
+    if price is None or price <= 0:
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text="⚠️ I could not get a valid price for this token. Try again shortly.",
+        )
+        return
+
+    try:
+        fill = await db.execute_paper_sell(
+            telegram_id,
+            position_id,
+            fraction,
+            price,
+            PAPER_FEE_RATE,
+            PAPER_SLIPPAGE_BPS,
+        )
+    except Exception as exc:  # noqa: BLE001 - user-facing failure
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text=_paper_error_text(exc),
+        )
+        return
+
+    symbol = _clean_text(fill.get("symbol") or position.get("symbol") or "Token", 30)
+    status = str(fill.get("position_status") or "open")
+    text = (
+        f"✅ Paper sell filled: {symbol}\n\n"
+        f"Sold: {_format_quantity(fill.get('quantity'))}\n"
+        f"Average fill price: {_format_price(fill.get('price_usd'))}\n"
+        f"Proceeds: {_format_money(fill.get('cash_amount_usd'))}\n"
+        f"Fee: {_format_money(fill.get('fee_usd'))}\n"
+        f"Realized P&L: {_format_money(fill.get('realized_pnl_usd'))}\n"
+        f"Position: {'Closed' if status == 'closed' else 'Still open'}\n"
+        f"Cash: {_format_money(fill.get('cash_balance'))}"
+    )
+    if stale:
+        text += "\n\n⚠️ Live price was unavailable; the last known price was used."
+
+    await context.bot.send_message(
+        chat_id=telegram_id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "💼 View portfolio", callback_data="paper:portfolio"
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+async def _prompt_paper_input(
+    context: ContextTypes.DEFAULT_TYPE,
+    telegram_id: int,
+    text: str,
+    state: dict[str, Any],
+) -> None:
+    WAITING_FOR_VALUE.pop(telegram_id, None)
+    PENDING_PAPER_RESET.pop(telegram_id, None)
+    WAITING_FOR_PAPER_VALUE[telegram_id] = state
+    await context.bot.send_message(
+        chat_id=telegram_id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✖ Cancel", callback_data="paper:cancel")]]
+        ),
+    )
+
+
+async def _trigger_reset_confirmation(
+    context: ContextTypes.DEFAULT_TYPE,
+    telegram_id: int,
+    balance: float,
+) -> None:
+    await db.ensure_user(telegram_id)
+    WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
+    WAITING_FOR_VALUE.pop(telegram_id, None)
+    PENDING_PAPER_RESET[telegram_id] = balance
+    await context.bot.send_message(
+        chat_id=telegram_id,
+        text=(
+            "♻️ Reset paper account?\n\n"
+            f"New starting balance: {_format_money(balance)}\n"
+            "This deletes all paper positions, fills, alerts, and deposits. "
+            "Your filters and sent-token history stay intact."
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Reset", callback_data="preset:confirm"
+                    ),
+                    InlineKeyboardButton(
+                        "✖ Cancel", callback_data="preset:cancel"
+                    ),
+                ]
+            ]
+        ),
+    )
+
+
+async def _handle_paper_callback(
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    telegram_id: int,
+    data: str,
+) -> None:
+    try:
+        WAITING_FOR_VALUE.pop(telegram_id, None)
+        WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
+        if data == "paper:portfolio":
+            await _edit_portfolio(query, telegram_id)
+            return
+
+        if data.startswith("pf:refresh"):
+            parts = data.split(":")
+            page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            await _edit_portfolio(query, telegram_id, page)
+            return
+
+        if data.startswith("paper:page:"):
+            page_token = data.split(":", 2)[2]
+            page = int(page_token) if page_token.isdigit() else 0
+            await _edit_portfolio(query, telegram_id, page)
+            return
+
+        if data == "paper:history":
+            await _safe_edit(
+                query,
+                await _history_text(telegram_id),
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "« Portfolio", callback_data="paper:portfolio"
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+        if data == "paper:addfunds":
+            await _prompt_paper_input(
+                context,
+                telegram_id,
+                (
+                    "➕ Add paper funds\n\n"
+                    "Send the amount in USD, for example: 250\n"
+                    "This adds cash and is tracked as a deposit, not profit."
+                ),
+                {"action": "addfunds"},
+            )
+            return
+
+        if data == "paper:reset":
+            account = await db.get_paper_account(telegram_id)
+            balance = (
+                _coerce_float(account.get("starting_balance"))
+                if account
+                else None
+            ) or PAPER_STARTING_BALANCE
+            await _trigger_reset_confirmation(
+                context, telegram_id, balance
+            )
+            return
+
+        if data == "paper:cancel":
+            WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
+            PENDING_PAPER_RESET.pop(telegram_id, None)
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text="✖ Paper action cancelled.",
+            )
+            return
+
+        if data == "preset:confirm":
+            balance = PENDING_PAPER_RESET.pop(telegram_id, None)
+            if balance is None:
+                await context.bot.send_message(
+                    chat_id=telegram_id,
+                    text="⚠️ No reset is pending. Use /resetpaper first.",
+                )
+                return
+            try:
+                account = await db.reset_paper_account(telegram_id, balance)
+            except Exception as exc:  # noqa: BLE001
+                await context.bot.send_message(
+                    chat_id=telegram_id, text=_paper_error_text(exc)
+                )
+                return
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text=(
+                    "♻️ Paper account reset.\n\n"
+                    f"Cash: {_format_money(account.get('cash_balance'))}"
+                ),
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "💼 Portfolio", callback_data="paper:portfolio"
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+        if data == "preset:cancel":
+            PENDING_PAPER_RESET.pop(telegram_id, None)
+            await context.bot.send_message(
+                chat_id=telegram_id, text="✖ Reset cancelled."
+            )
+            return
+
+        if data.startswith("paper:pos:"):
+            position_id = data.split(":", 2)[2]
+            position = await db.get_paper_position(position_id, telegram_id)
+            if (
+                position is None
+                or position.get("status") != "open"
+                or (_coerce_float(position.get("quantity")) or 0.0) <= 0
+            ):
+                await _safe_edit(
+                    query, "⚠️ That paper position is no longer open."
+                )
+                return
+            price = await fetch_pair_price(
+                str(position.get("token_address") or ""),
+                str(position.get("chain_id") or ""),
+                str(position.get("pair_address") or ""),
+            )
+            await _safe_edit(
+                query,
+                _position_text(position, price),
+                _position_keyboard(position),
+            )
+            return
+
+        if data.startswith("pb:"):
+            parts = data.split(":")
+            if len(parts) != 3:
+                await _safe_edit(query, "⚠️ Invalid buy button.")
+                return
+            alert_id = int(parts[1])
+            amount_token = parts[2]
+            if amount_token == "custom":
+                await _prompt_paper_input(
+                    context,
+                    telegram_id,
+                    (
+                        "📄 Custom paper buy\n\n"
+                        "Send the USD amount to spend, for example: 75"
+                    ),
+                    {"action": "paper_buy", "alert_id": alert_id},
+                )
+                return
+            amount = _coerce_float(amount_token)
+            if amount is None or amount <= 0:
+                await _safe_edit(query, "⚠️ Invalid buy amount.")
+                return
+            await _execute_paper_buy(context, telegram_id, alert_id, amount)
+            return
+
+        if data.startswith("ps:"):
+            parts = data.split(":")
+            if len(parts) != 3:
+                await _safe_edit(query, "⚠️ Invalid sell button.")
+                return
+            position_id = parts[1]
+            fraction_token = parts[2]
+            if fraction_token == "custom":
+                await _prompt_paper_input(
+                    context,
+                    telegram_id,
+                    (
+                        "📉 Custom paper sell\n\n"
+                        "Send the percentage of the position to sell (1–100), "
+                        "for example: 40"
+                    ),
+                    {"action": "paper_sell", "position_id": position_id},
+                )
+                return
+            percent = _coerce_float(fraction_token)
+            if percent is None or percent <= 0 or percent > 100:
+                await _safe_edit(query, "⚠️ Invalid sell percentage.")
+                return
+            await _execute_paper_sell(
+                context, telegram_id, position_id, percent / 100.0
+            )
+            return
+
+        await _safe_edit(query, "⚠️ Unknown paper-trading action.")
+    except db.PaperTradingError as exc:
+        await context.bot.send_message(chat_id=telegram_id, text=exc.message)
+    except Exception:
+        logger.exception("Paper callback failed for user %s", telegram_id)
+        await _safe_edit(
+            query, "⚠️ Something went wrong with the paper trade."
+        )
+
+
+async def _handle_paper_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict[str, Any],
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or message.text is None:
+        return
+
+    telegram_id = int(user.id)
+    action = state.get("action")
+    text = message.text.strip()
+
+    if action == "paper_buy":
+        amount, error = _parse_usd_amount(text)
+        if error:
+            await message.reply_text(f"⚠️ {error}\n\nTry again, or send /cancel.")
+            return
+        WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
+        await _execute_paper_buy(
+            context, telegram_id, int(state["alert_id"]), amount
+        )
+        return
+
+    if action == "paper_sell":
+        raw_percent = text.replace("%", "").replace(",", "").strip()
+        try:
+            percent = float(raw_percent)
+        except ValueError:
+            await message.reply_text(
+                "⚠️ Enter a percentage between 1 and 100."
+            )
+            return
+        if not math.isfinite(percent) or percent <= 0 or percent > 100:
+            await message.reply_text(
+                "⚠️ Enter a percentage between 1 and 100."
+            )
+            return
+        WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
+        await _execute_paper_sell(
+            context,
+            telegram_id,
+            str(state["position_id"]),
+            percent / 100.0,
+        )
+        return
+
+    if action == "addfunds":
+        amount, error = _parse_usd_amount(text)
+        if error:
+            await message.reply_text(f"⚠️ {error}\n\nTry again, or send /cancel.")
+            return
+        WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
+        try:
+            await _ensure_paper_account(telegram_id)
+            account = await db.add_paper_funds(telegram_id, amount)
+        except Exception as exc:  # noqa: BLE001
+            await message.reply_text(_paper_error_text(exc))
+            return
+        await message.reply_text(
+            f"✅ Added {_format_money(amount)} in paper funds.\n"
+            f"Cash: {_format_money(account.get('cash_balance'))}\n"
+            f"Total deposited: {_format_money(account.get('total_deposited'))}"
+        )
+        return
+
+    if action == "setbalance":
+        amount, error = _parse_usd_amount(text)
+        if error:
+            await message.reply_text(f"⚠️ {error}\n\nTry again, or send /cancel.")
+            return
+        WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
+        try:
+            await _ensure_paper_account(telegram_id)
+            account = await db.set_paper_balance(telegram_id, amount)
+        except Exception as exc:  # noqa: BLE001
+            await message.reply_text(_paper_error_text(exc))
+            return
+        await message.reply_text(
+            f"✅ Starting paper balance set to "
+            f"{_format_money(account.get('starting_balance'))}."
+        )
+        return
+
+    WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
+    await message.reply_text("⚠️ Unknown paper-trading action.")
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -615,9 +1597,12 @@ async def start(
         return
 
     WAITING_FOR_VALUE.pop(user.id, None)
+    WAITING_FOR_PAPER_VALUE.pop(user.id, None)
+    PENDING_PAPER_RESET.pop(user.id, None)
 
     try:
         await db.ensure_user(user.id)
+        await _ensure_paper_account(user.id)
     except Exception:
         logger.exception("Could not create user %s", user.id)
         await message.reply_text(
@@ -627,8 +1612,10 @@ async def start(
 
     await message.reply_text(
         "👋 Welcome to the Crypto Scanner Bot.\n\n"
-        "Use /filter to configure your token filters. "
-        "The scanner runs automatically every minute."
+        "Use /filter to configure your token filters.\n"
+        f"Your paper balance starts at {_format_money(PAPER_STARTING_BALANCE)}.\n"
+        "Use /setbalance before your first trade to choose another amount.\n"
+        "Use /portfolio to see PnL and /addfunds to top up fake cash anytime."
     )
 
 
@@ -645,6 +1632,8 @@ async def filter_command(
         return
 
     WAITING_FOR_VALUE.pop(user.id, None)
+    WAITING_FOR_PAPER_VALUE.pop(user.id, None)
+    PENDING_PAPER_RESET.pop(user.id, None)
 
     try:
         filter_data = await _get_or_create_filter(user.id)
@@ -670,7 +1659,195 @@ async def cancel_command(
         return
 
     WAITING_FOR_VALUE.pop(user.id, None)
-    await message.reply_text("✖ Edit cancelled.")
+    WAITING_FOR_PAPER_VALUE.pop(user.id, None)
+    PENDING_PAPER_RESET.pop(user.id, None)
+    await message.reply_text("✖ Action cancelled.")
+
+
+async def portfolio_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+    if not _is_allowed(user.id):
+        await message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    WAITING_FOR_VALUE.pop(user.id, None)
+    WAITING_FOR_PAPER_VALUE.pop(user.id, None)
+    PENDING_PAPER_RESET.pop(user.id, None)
+
+    try:
+        await _show_portfolio_message(message, user.id)
+    except Exception:
+        logger.exception("Could not load portfolio for %s", user.id)
+        await message.reply_text(
+            "⚠️ I could not load your paper portfolio. Please try again."
+        )
+
+
+async def history_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+    if not _is_allowed(user.id):
+        await message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    WAITING_FOR_VALUE.pop(user.id, None)
+    WAITING_FOR_PAPER_VALUE.pop(user.id, None)
+    PENDING_PAPER_RESET.pop(user.id, None)
+
+    try:
+        text = await _history_text(user.id)
+    except Exception:
+        logger.exception("Could not load paper history for %s", user.id)
+        await message.reply_text(
+            "⚠️ I could not load your paper trade history."
+        )
+        return
+
+    await message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "« Portfolio", callback_data="paper:portfolio"
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+async def add_funds_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+    if not _is_allowed(user.id):
+        await message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    WAITING_FOR_VALUE.pop(user.id, None)
+    WAITING_FOR_PAPER_VALUE.pop(user.id, None)
+    PENDING_PAPER_RESET.pop(user.id, None)
+
+    if context.args:
+        amount, error = _parse_usd_amount(" ".join(context.args))
+        if error:
+            await message.reply_text(f"⚠️ {error}")
+            return
+        try:
+            await _ensure_paper_account(user.id)
+            account = await db.add_paper_funds(user.id, amount)
+        except Exception as exc:  # noqa: BLE001
+            await message.reply_text(_paper_error_text(exc))
+            return
+        await message.reply_text(
+            f"✅ Added {_format_money(amount)} in paper funds.\n"
+            f"Cash: {_format_money(account.get('cash_balance'))}\n"
+            f"Total deposited: {_format_money(account.get('total_deposited'))}"
+        )
+        return
+
+    await _prompt_paper_input(
+        context,
+        user.id,
+        (
+            "➕ Add paper funds\n\n"
+            "Send the amount in USD, for example: 250\n"
+            "This adds cash and is tracked as a deposit, not profit."
+        ),
+        {"action": "addfunds"},
+    )
+
+
+async def set_balance_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+    if not _is_allowed(user.id):
+        await message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    WAITING_FOR_VALUE.pop(user.id, None)
+    WAITING_FOR_PAPER_VALUE.pop(user.id, None)
+    PENDING_PAPER_RESET.pop(user.id, None)
+
+    if context.args:
+        amount, error = _parse_usd_amount(" ".join(context.args))
+        if error:
+            await message.reply_text(f"⚠️ {error}")
+            return
+        try:
+            await _ensure_paper_account(user.id)
+            account = await db.set_paper_balance(user.id, amount)
+        except Exception as exc:  # noqa: BLE001
+            await message.reply_text(_paper_error_text(exc))
+            return
+        await message.reply_text(
+            f"✅ Starting paper balance set to "
+            f"{_format_money(account.get('starting_balance'))}."
+        )
+        return
+
+    await _prompt_paper_input(
+        context,
+        user.id,
+        (
+            "💵 Set starting paper balance\n\n"
+            "Send the starting amount in USD, for example: 1000\n"
+            "This is only allowed before your first paper trade."
+        ),
+        {"action": "setbalance"},
+    )
+
+
+async def reset_paper_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+    if not _is_allowed(user.id):
+        await message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    balance = PAPER_STARTING_BALANCE
+    try:
+        account = await db.get_paper_account(user.id)
+    except Exception:
+        logger.warning("Could not load account for reset", exc_info=True)
+        account = None
+    if account:
+        balance = _coerce_float(account.get("starting_balance")) or balance
+
+    if context.args:
+        parsed_balance, error = _parse_usd_amount(" ".join(context.args))
+        if error:
+            await message.reply_text(f"⚠️ {error}")
+            return
+        balance = parsed_balance
+
+    await _trigger_reset_confirmation(context, user.id, balance)
 
 
 # ---------------------------------------------------------------------------
@@ -698,7 +1875,13 @@ async def callback_handler(
     telegram_id = int(user.id)
     data = query.data or "menu:main"
 
+    if data.startswith(("pb:", "ps:", "pf:", "paper:", "preset:")):
+        await _handle_paper_callback(query, context, telegram_id, data)
+        return
+
     try:
+        WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
+        PENDING_PAPER_RESET.pop(telegram_id, None)
         if data == "cancel":
             WAITING_FOR_VALUE.pop(telegram_id, None)
 
@@ -719,6 +1902,7 @@ async def callback_handler(
                 await _safe_edit(query, "⚠️ Unknown filter field.")
                 return
 
+            WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
             WAITING_FOR_VALUE[telegram_id] = {"field": field}
             label = EDITABLE_FIELDS[field]["label"]
             if field in TEXT_FIELDS:
@@ -920,6 +2104,12 @@ async def handle_waiting_value(
         return
     if not _is_allowed(user.id):
         WAITING_FOR_VALUE.pop(user.id, None)
+        WAITING_FOR_PAPER_VALUE.pop(user.id, None)
+        return
+
+    paper_state = WAITING_FOR_PAPER_VALUE.get(user.id)
+    if paper_state is not None:
+        await _handle_paper_text(update, context, paper_state)
         return
 
     state = WAITING_FOR_VALUE.get(user.id)
@@ -970,6 +2160,7 @@ async def send_alert(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     match: dict[str, Any],
+    alert_id: int | None = None,
 ) -> None:
     """Format and send one token alert as Telegram Markdown."""
 
@@ -1001,6 +2192,7 @@ async def send_alert(
     if mcap is None:
         mcap = _coerce_float(pair.get("fdv"))
 
+    price = _coerce_float(pair.get("priceUsd"))
     chain = str(pair.get("chainId") or "unknown")
     pair_address = str(pair.get("pairAddress") or "")
 
@@ -1012,6 +2204,7 @@ async def send_alert(
         "🚀 *New Token Match*\n\n"
         f"*Token:* {_escape_markdown(token_display)}\n"
         f"*Chain:* {_escape_markdown(chain)}\n"
+        f"*Price:* {_escape_markdown(_format_price(price))}\n"
         f"*Liquidity:* {_escape_markdown(_format_money(liquidity))}\n"
         f"*MCAP:* {_escape_markdown(_format_money(mcap))}\n"
         f"*Age:* {_escape_markdown(_format_age(pair))}\n\n"
@@ -1022,11 +2215,33 @@ async def send_alert(
     if warning:
         text += f"\n\n{_escape_markdown(warning)}"
 
+    reply_markup = None
+    if alert_id is not None:
+        text += "\n\n_Paper trade buttons expire in 1 hour._"
+        reply_markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"🧪 Paper ${amount:g}",
+                        callback_data=f"pb:{alert_id}:{amount:g}",
+                    )
+                    for amount in PAPER_BUY_PRESETS
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Custom amount",
+                        callback_data=f"pb:{alert_id}:custom",
+                    )
+                ],
+            ]
+        )
+
     await context.bot.send_message(
         chat_id=int(chat_id),
         text=text,
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
+        reply_markup=reply_markup,
     )
 
 
@@ -1047,13 +2262,16 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
     for entry in active_users:
         telegram_id = entry.get("telegram_id")
         filter_data = entry.get("filter")
+        filter_id = entry.get("active_filter_id") or (
+            filter_data.get("id") if isinstance(filter_data, dict) else None
+        )
 
         if telegram_id is None or not isinstance(filter_data, dict):
             stats["errors"] += 1
             continue
 
         try:
-            matches = await scan_dexscreener(filter_data)
+            matches = await scan_dexscreener(filter_data, int(telegram_id))
         except Exception:  # noqa: BLE001 - isolate failures per user
             logger.exception("Scan failed for user %s", telegram_id)
             stats["errors"] += 1
@@ -1062,8 +2280,32 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
         stats["matches"] += len(matches)
 
         for match in matches:
+            pair = match.get("pair")
+            alert_id: int | None = None
+
+            if isinstance(pair, dict):
+                try:
+                    alert = await db.create_paper_alert(
+                        int(telegram_id),
+                        str(filter_id) if filter_id else None,
+                        pair,
+                        match.get("warning"),
+                    )
+                    if alert is not None:
+                        alert_id = int(alert["id"])
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Could not persist paper alert for user %s",
+                        telegram_id,
+                    )
+
             try:
-                await send_alert(context, int(telegram_id), match)
+                await send_alert(
+                    context,
+                    int(telegram_id),
+                    match,
+                    alert_id=alert_id,
+                )
                 stats["alerts_sent"] += 1
             except TelegramError:
                 logger.exception("Could not send alert to user %s", telegram_id)
@@ -1091,6 +2333,8 @@ async def error_handler(
 # Re-exported for main.py's generic context construction.
 __all__ = [
     "ALLOWED_USERS",
+    "PAPER_STARTING_BALANCE",
+    "WAITING_FOR_PAPER_VALUE",
     "WAITING_FOR_VALUE",
     "get_telegram_app",
     "initialize",

@@ -313,6 +313,108 @@ async def _fetch_pairs_by_addresses(
     return [pair for pair in pairs if isinstance(pair, dict)]
 
 
+async def fetch_current_prices(
+    requests: list[tuple[str, str, str]],
+) -> dict[tuple[str, str], float]:
+    """Fetch current USD prices for ``(token, chain, pair)`` requests.
+
+    Returns a mapping of ``(chain_id_lower, pair_address_lower)`` to price.
+    If the exact pair is missing, the highest-liquidity pair for the same token
+    and chain is used as a fallback.
+    """
+
+    if not requests:
+        return {}
+
+    token_addresses = list(
+        dict.fromkeys(
+            str(token).strip()
+            for token, _chain, _pair in requests
+            if str(token).strip()
+        )
+    )
+    if not token_addresses:
+        return {}
+
+    pairs: list[dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": USER_AGENT},
+            follow_redirects=True,
+        ) as client:
+            for index in range(0, len(token_addresses), MAX_DISCOVERY_ADDRESSES):
+                chunk = token_addresses[index : index + MAX_DISCOVERY_ADDRESSES]
+                pairs.extend(await _fetch_pairs_by_addresses(client, chunk))
+    except Exception as exc:  # noqa: BLE001 - callers can use their last price
+        logger.warning("Could not refresh paper-trade prices: %s", exc)
+        return {}
+
+    prices_by_pair: dict[tuple[str, str], float] = {}
+    best_by_token: dict[tuple[str, str], tuple[float, float]] = {}
+
+    for pair in pairs:
+        price = _as_float(pair.get("priceUsd"))
+        if price is None:
+            continue
+
+        chain_id = str(pair.get("chainId") or "").strip().lower()
+        pair_address = str(pair.get("pairAddress") or "").strip().lower()
+        base_token = pair.get("baseToken")
+        token_address = (
+            str(base_token.get("address") or "").strip().lower()
+            if isinstance(base_token, dict)
+            else ""
+        )
+
+        if pair_address:
+            prices_by_pair[(chain_id, pair_address)] = price
+
+        if token_address:
+            liquidity_data = pair.get("liquidity")
+            liquidity = (
+                _as_float(liquidity_data.get("usd"))
+                if isinstance(liquidity_data, dict)
+                else None
+            ) or 0.0
+            key = (chain_id, token_address)
+            if key not in best_by_token or liquidity > best_by_token[key][0]:
+                best_by_token[key] = (liquidity, price)
+
+    result: dict[tuple[str, str], float] = {}
+    for token_address, chain_id, pair_address in requests:
+        pair_key = (
+            str(chain_id).strip().lower(),
+            str(pair_address).strip().lower(),
+        )
+        price = prices_by_pair.get(pair_key)
+        if price is None:
+            token_key = (
+                str(chain_id).strip().lower(),
+                str(token_address).strip().lower(),
+            )
+            fallback = best_by_token.get(token_key)
+            price = fallback[1] if fallback else None
+        if price is not None:
+            result[pair_key] = price
+
+    return result
+
+
+async def fetch_pair_price(
+    token_address: str,
+    chain_id: str,
+    pair_address: str,
+) -> float | None:
+    """Return the current USD price for one token pair."""
+
+    prices = await fetch_current_prices(
+        [(token_address, chain_id, pair_address)]
+    )
+    key = (chain_id.strip().lower(), pair_address.strip().lower())
+    return prices.get(key)
+
+
 async def _verify_with_geckoterminal(
     client: httpx.AsyncClient,
     pair: dict[str, Any],
@@ -396,15 +498,18 @@ async def _verify_with_geckoterminal(
 
 async def scan_dexscreener(
     filter_data: dict[str, Any] | None,
+    telegram_id: int,
 ) -> list[dict[str, Any]]:
     """Scan DexScreener and return matches in the required format.
 
     Each match is ``{"pair": <raw DexScreener pair>, "warning": <str|None>}``.
+    Duplicate suppression is scoped to the supplied Telegram user.
     """
 
     if not isinstance(filter_data, dict) or not filter_data:
         return []
 
+    telegram_id = int(telegram_id)
     matches: list[dict[str, Any]] = []
 
     try:
@@ -430,7 +535,9 @@ async def scan_dexscreener(
                     continue
 
                 try:
-                    already_sent = await is_token_recently_sent(token_address)
+                    already_sent = await is_token_recently_sent(
+                        telegram_id, token_address
+                    )
                 except Exception:  # noqa: BLE001 - a DB hiccup should not stop the scan
                     logger.exception(
                         "Duplicate check failed for %s; continuing", token_address
@@ -448,7 +555,9 @@ async def scan_dexscreener(
 
                 chain_id = str(pair.get("chainId") or "")
                 try:
-                    await mark_token_as_sent(token_address, chain_id)
+                    await mark_token_as_sent(
+                        telegram_id, token_address, chain_id
+                    )
                 except Exception:  # noqa: BLE001 - still alert if marking fails
                     logger.exception(
                         "Failed to mark %s as sent; alert will still be emitted",
