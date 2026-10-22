@@ -347,6 +347,8 @@ _RPC_ERROR_MESSAGES = {
     "account_not_found": "Paper account not found. Open /portfolio first.",
     "insufficient_funds": "Not enough paper cash for that buy.",
     "position_not_found": "That paper position is no longer open.",
+    "rule_not_found": "That auto-sell rule no longer exists.",
+    "rule_already_triggered": "That auto-sell rule already triggered.",
     "trading_started": (
         "Trading has already started. Use /resetpaper to start over with "
         "a new balance."
@@ -607,6 +609,143 @@ async def get_paper_fills(
         .limit(max(1, min(int(limit), 100)))
     )
     return _response_rows(response)
+
+
+async def set_auto_buy(
+    telegram_id: int,
+    enabled: bool,
+    amount: float | None = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "p_telegram_id": int(telegram_id),
+        "p_enabled": bool(enabled),
+    }
+    if amount is not None:
+        params["p_amount"] = float(amount)
+    return await _rpc("paper_set_auto_buy", params)
+
+
+async def get_auto_sell_rules(
+    telegram_id: int,
+    enabled_only: bool = True,
+) -> list[dict[str, Any]]:
+    query = (
+        get_supabase()
+        .table("paper_auto_sell_rules")
+        .select("*")
+        .eq("telegram_id", int(telegram_id))
+        .order("target_multiple")
+    )
+    if enabled_only:
+        query = query.eq("enabled", True)
+    return _response_rows(await _execute(query))
+
+
+async def get_all_auto_sell_rules() -> list[dict[str, Any]]:
+    response = await _execute(
+        get_supabase()
+        .table("paper_auto_sell_rules")
+        .select("*")
+        .eq("enabled", True)
+        .order("target_multiple")
+    )
+    return _response_rows(response)
+
+
+async def add_auto_sell_rule(
+    telegram_id: int,
+    target_multiple: float,
+    sell_percent: float,
+) -> dict[str, Any]:
+    payload = {
+        "telegram_id": int(telegram_id),
+        "target_multiple": float(target_multiple),
+        "sell_percent": float(sell_percent),
+        "enabled": True,
+    }
+    try:
+        response = await _execute(
+            get_supabase().table("paper_auto_sell_rules").insert(payload)
+        )
+    except Exception as exc:  # noqa: BLE001
+        text = str(exc).lower()
+        if "duplicate" in text or "unique" in text:
+            raise PaperTradingError(
+                "duplicate_rule",
+                "An auto-sell rule for that multiple already exists.",
+            ) from exc
+        raise
+
+    rows = _response_rows(response)
+    if not rows:
+        raise PaperTradingError(
+            "rule_create_failed", "Could not create the auto-sell rule."
+        )
+    return rows[0]
+
+
+async def delete_auto_sell_rule(
+    telegram_id: int,
+    rule_id: int,
+) -> bool:
+    response = await _execute(
+        get_supabase()
+        .table("paper_auto_sell_rules")
+        .delete()
+        .eq("id", int(rule_id))
+        .eq("telegram_id", int(telegram_id))
+    )
+    return bool(_response_rows(response))
+
+
+async def clear_auto_sell_rules(telegram_id: int) -> None:
+    await _execute(
+        get_supabase()
+        .table("paper_auto_sell_rules")
+        .delete()
+        .eq("telegram_id", int(telegram_id))
+    )
+
+
+async def get_all_open_paper_positions() -> list[dict[str, Any]]:
+    response = await _execute(
+        get_supabase()
+        .table("paper_positions")
+        .select("*")
+        .eq("status", "open")
+        .order("opened_at", desc=True)
+    )
+    return _response_rows(response)
+
+
+async def get_all_auto_sell_events() -> list[dict[str, Any]]:
+    response = await _execute(
+        get_supabase()
+        .table("paper_auto_sell_events")
+        .select("rule_id, position_id, telegram_id")
+    )
+    return _response_rows(response)
+
+
+async def execute_paper_auto_sell(
+    telegram_id: int,
+    rule_id: int,
+    position_id: str,
+    market_price: float,
+    fee_rate: float,
+    slippage_bps: int,
+) -> dict[str, Any]:
+    return await _rpc(
+        "paper_auto_sell",
+        {
+            "p_telegram_id": int(telegram_id),
+            "p_rule_id": int(rule_id),
+            "p_position_id": str(position_id),
+            "p_market_price": float(market_price),
+            "p_fee_rate": float(fee_rate),
+            "p_slippage_bps": int(slippage_bps),
+        },
+    )
 
 
 async def execute_paper_buy(

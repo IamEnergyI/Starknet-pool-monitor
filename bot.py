@@ -212,6 +212,8 @@ def _build_application() -> Application:
     application.add_handler(CommandHandler("addfunds", add_funds_command))
     application.add_handler(CommandHandler("setbalance", set_balance_command))
     application.add_handler(CommandHandler("resetpaper", reset_paper_command))
+    application.add_handler(CommandHandler("autobuy", auto_buy_command))
+    application.add_handler(CommandHandler("autosell", auto_sell_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_waiting_value)
@@ -262,6 +264,8 @@ async def initialize() -> Application:
                 BotCommand("addfunds", "Add fake paper funds"),
                 BotCommand("setbalance", "Set starting paper balance"),
                 BotCommand("resetpaper", "Reset paper account"),
+                BotCommand("autobuy", "Auto-buy new alerts"),
+                BotCommand("autosell", "Manage take-profit rules"),
                 BotCommand("cancel", "Cancel a pending action"),
             ]
         )
@@ -806,6 +810,27 @@ async def _build_portfolio(telegram_id: int) -> dict[str, Any]:
         _coerce_float(position.get("realized_pnl_usd")) or 0.0
         for position in all_positions
     )
+    closed_positions = [
+        position
+        for position in all_positions
+        if position.get("status") == "closed"
+    ]
+    wins = sum(
+        1
+        for position in closed_positions
+        if (_coerce_float(position.get("realized_pnl_usd")) or 0.0) > 0
+    )
+    losses = sum(
+        1
+        for position in closed_positions
+        if (_coerce_float(position.get("realized_pnl_usd")) or 0.0) < 0
+    )
+    breakeven = len(closed_positions) - wins - losses
+    win_rate = (
+        (wins / len(closed_positions) * 100.0)
+        if closed_positions
+        else None
+    )
     equity = cash + positions_value
     net_pnl = equity - total_deposited
     net_pct = (net_pnl / total_deposited * 100.0) if total_deposited > 0 else 0.0
@@ -822,6 +847,11 @@ async def _build_portfolio(telegram_id: int) -> dict[str, Any]:
         "unrealized": unrealized_total,
         "net_pnl": net_pnl,
         "net_pct": net_pct,
+        "closed_count": len(closed_positions),
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "win_rate": win_rate,
         "stale_prices": any_stale,
     }
 
@@ -853,6 +883,30 @@ def _portfolio_text(snapshot: dict[str, Any], page: int = 0) -> str:
         ),
         f"Realized: {_format_money(snapshot['realized'])}",
         f"Unrealized: {_format_money(snapshot['unrealized'])}",
+        (
+            "Auto-buy: "
+            + (
+                f"ON · {_format_money(snapshot['account'].get('auto_buy_amount'))}"
+                if snapshot["account"].get("auto_buy_enabled")
+                else "OFF"
+            )
+        ),
+        (
+            f"Closed trades: {snapshot['closed_count']} · "
+            f"Win rate: "
+            + (
+                f"{snapshot['win_rate']:.1f}% "
+                f"({snapshot['wins']}W / {snapshot['losses']}L"
+                + (
+                    f" / {snapshot['breakeven']}BE"
+                    if snapshot["breakeven"]
+                    else ""
+                )
+                + ")"
+                if snapshot["win_rate"] is not None
+                else "N/A"
+            )
+        ),
     ]
 
     if snapshot["stale_prices"]:
@@ -1129,14 +1183,16 @@ async def _execute_paper_buy(
     telegram_id: int,
     alert_id: int,
     amount: float,
-) -> None:
+    *,
+    auto: bool = False,
+) -> bool:
     alert = await db.get_paper_alert(alert_id, telegram_id)
     if alert is None:
         await context.bot.send_message(
             chat_id=telegram_id,
             text="⚠️ That alert is no longer available.",
         )
-        return
+        return False
 
     price = await fetch_pair_price(
         str(alert.get("token_address") or ""),
@@ -1151,7 +1207,7 @@ async def _execute_paper_buy(
             chat_id=telegram_id,
             text="⚠️ I could not get a valid price for this token. Try again shortly.",
         )
-        return
+        return False
 
     try:
         await _ensure_paper_account(telegram_id)
@@ -1168,11 +1224,12 @@ async def _execute_paper_buy(
             chat_id=telegram_id,
             text=_paper_error_text(exc),
         )
-        return
+        return False
 
     symbol = _clean_text(fill.get("symbol") or alert.get("symbol") or "Token", 30)
+    heading = "🤖 Auto-buy filled" if auto else "✅ Paper buy filled"
     text = (
-        f"✅ Paper buy filled: {symbol}\n\n"
+        f"{heading}: {symbol}\n\n"
         f"Spent: {_format_money(fill.get('cash_amount_usd'))}\n"
         f"Fee: {_format_money(fill.get('fee_usd'))}\n"
         f"Average fill price: {_format_price(fill.get('price_usd'))}\n"
@@ -1182,19 +1239,25 @@ async def _execute_paper_buy(
     if stale:
         text += "\n\n⚠️ Live price was unavailable; the alert price was used."
 
-    await context.bot.send_message(
-        chat_id=telegram_id,
-        text=text,
-        reply_markup=InlineKeyboardMarkup(
-            [
+    try:
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        "💼 View portfolio", callback_data="paper:portfolio"
-                    )
+                    [
+                        InlineKeyboardButton(
+                            "💼 View portfolio", callback_data="paper:portfolio"
+                        )
+                    ]
                 ]
-            ]
-        ),
-    )
+            ),
+        )
+    except TelegramError:
+        logger.exception(
+            "Paper buy executed for %s but confirmation failed", telegram_id
+        )
+    return True
 
 
 async def _execute_paper_sell(
@@ -1309,7 +1372,8 @@ async def _trigger_reset_confirmation(
             "♻️ Reset paper account?\n\n"
             f"New starting balance: {_format_money(balance)}\n"
             "This deletes all paper positions, fills, alerts, and deposits. "
-            "Your filters and sent-token history stay intact."
+            "Your filters, sent-token history, auto-buy setting, and auto-sell "
+            "rules stay intact."
         ),
         reply_markup=InlineKeyboardMarkup(
             [
@@ -1652,7 +1716,9 @@ async def start(
         "Use /filter to configure your token filters.\n"
         f"Your paper balance starts at {_format_money(PAPER_STARTING_BALANCE)}.\n"
         "Use /setbalance before your first trade to choose another amount.\n"
-        "Use /portfolio to see PnL and /addfunds to top up fake cash anytime."
+        "Use /portfolio to see PnL and /addfunds to top up fake cash anytime.\n"
+        "Use /autobuy 25 to buy every new alert automatically.\n"
+        "Use /autosell add 2 50 to sell 50% at 2x."
     )
 
 
@@ -1881,6 +1947,204 @@ async def reset_paper_command(
         balance = parsed_balance
 
     await _trigger_reset_confirmation(context, user.id, balance)
+
+
+def _auto_sell_rules_text(rules: list[dict[str, Any]]) -> str:
+    lines = ["🎯 Auto-Sell Rules", ""]
+    if not rules:
+        lines.append("No automatic take-profit rules configured.")
+    else:
+        for rule in rules:
+            rule_id = int(rule["id"])
+            multiple = _coerce_float(rule.get("target_multiple")) or 0.0
+            percent = _coerce_float(rule.get("sell_percent")) or 0.0
+            lines.append(
+                f"#{rule_id} · At {multiple:g}x, sell {percent:g}% of "
+                "the remaining position"
+            )
+    lines.extend(
+        [
+            "",
+            "Rules apply to all open and future paper positions.",
+            "Percentages are based on the quantity remaining at trigger time.",
+            "",
+            "Add: /autosell add 2 50",
+            "Remove: /autosell remove <rule id>",
+            "Clear all: /autosell clear",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def _reply_auto_sell_rules(message: Any, telegram_id: int) -> None:
+    rules = await db.get_auto_sell_rules(telegram_id, enabled_only=False)
+    await message.reply_text(_auto_sell_rules_text(rules))
+
+
+async def auto_buy_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+    if not _is_allowed(user.id):
+        await message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    WAITING_FOR_VALUE.pop(user.id, None)
+    WAITING_FOR_PAPER_VALUE.pop(user.id, None)
+    PENDING_PAPER_RESET.pop(user.id, None)
+
+    try:
+        account = await _ensure_paper_account(user.id)
+    except Exception as exc:  # noqa: BLE001
+        await message.reply_text(_paper_error_text(exc))
+        return
+
+    if not context.args:
+        enabled = bool(account.get("auto_buy_enabled"))
+        amount = _format_money(account.get("auto_buy_amount"))
+        await message.reply_text(
+            "🤖 Auto-Buy\n\n"
+            f"Status: {'ON' if enabled else 'OFF'}\n"
+            f"Amount per new alert: {amount}\n\n"
+            "Enable: /autobuy 25\n"
+            "Disable: /autobuy off"
+        )
+        return
+
+    first = context.args[0].strip().lower()
+    if first in {"off", "disable", "stop"}:
+        try:
+            account = await db.set_auto_buy(user.id, False)
+        except Exception as exc:  # noqa: BLE001
+            await message.reply_text(_paper_error_text(exc))
+            return
+        await message.reply_text(
+            "🤖 Auto-buy disabled.\n"
+            f"Saved amount: {_format_money(account.get('auto_buy_amount'))}"
+        )
+        return
+
+    raw_amount = " ".join(
+        context.args[1:] if first == "on" else context.args
+    )
+    amount, error = _parse_usd_amount(raw_amount)
+    if error:
+        await message.reply_text(f"⚠️ {error}")
+        return
+
+    try:
+        account = await db.set_auto_buy(user.id, True, amount)
+    except Exception as exc:  # noqa: BLE001
+        await message.reply_text(_paper_error_text(exc))
+        return
+
+    await message.reply_text(
+        "🤖 Auto-buy enabled.\n"
+        f"Amount per new alert: {_format_money(account.get('auto_buy_amount'))}"
+    )
+
+
+async def auto_sell_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+    if not _is_allowed(user.id):
+        await message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    args = [arg.strip() for arg in context.args if arg.strip()]
+    subcommand = args[0].lower() if args else "list"
+
+    try:
+        await _ensure_paper_account(user.id)
+
+        if subcommand in {"list", "show"}:
+            await _reply_auto_sell_rules(message, user.id)
+            return
+
+        if subcommand == "clear":
+            await db.clear_auto_sell_rules(user.id)
+            await message.reply_text("🧹 All auto-sell rules removed.")
+            return
+
+        if subcommand == "remove":
+            if len(args) < 2:
+                await message.reply_text("Usage: /autosell remove <rule id>")
+                return
+            try:
+                rule_id = int(args[1].lstrip("#"))
+            except ValueError:
+                await message.reply_text("⚠️ The rule id must be a number.")
+                return
+            deleted = await db.delete_auto_sell_rule(user.id, rule_id)
+            if deleted:
+                await message.reply_text(f"🗑 Removed auto-sell rule #{rule_id}.")
+            else:
+                await message.reply_text(
+                    f"⚠️ No auto-sell rule #{rule_id} found."
+                )
+            return
+
+        if subcommand == "add":
+            if len(args) < 3:
+                await message.reply_text(
+                    "Usage: /autosell add <multiple> <percent>\n"
+                    "Example: /autosell add 2 50"
+                )
+                return
+            try:
+                multiple = float(args[1].lower().rstrip("x"))
+                percent = float(args[2].rstrip("%"))
+            except ValueError:
+                await message.reply_text(
+                    "⚠️ Multiple and percent must be numbers. "
+                    "Example: /autosell add 2 50"
+                )
+                return
+            if not math.isfinite(multiple) or multiple <= 1:
+                await message.reply_text(
+                    "⚠️ The target multiple must be greater than 1."
+                )
+                return
+            if not math.isfinite(percent) or percent <= 0 or percent > 100:
+                await message.reply_text(
+                    "⚠️ The sell percentage must be between 0 and 100."
+                )
+                return
+
+            try:
+                rule = await db.add_auto_sell_rule(
+                    user.id, multiple, percent
+                )
+            except db.PaperTradingError as exc:
+                await message.reply_text(f"⚠️ {exc.message}")
+                return
+
+            await message.reply_text(
+                f"✅ Auto-sell rule added: at {multiple:g}x, sell "
+                f"{percent:g}% of the remaining position.\n"
+                f"Rule id: #{rule['id']}"
+            )
+            return
+
+        await message.reply_text(
+            "Usage:\n"
+            "/autosell — list rules\n"
+            "/autosell add 2 50 — at 2x, sell 50%\n"
+            "/autosell remove <id>\n"
+            "/autosell clear"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Auto-sell command failed for user %s", user.id)
+        await message.reply_text(_paper_error_text(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -2278,6 +2542,148 @@ async def send_alert(
     )
 
 
+async def _process_auto_sells(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> dict[str, int]:
+    stats = {"auto_sells": 0, "auto_sell_errors": 0}
+
+    positions = await db.get_all_open_paper_positions()
+    if not positions:
+        return stats
+
+    rules = await db.get_all_auto_sell_rules()
+    if not rules:
+        return stats
+
+    events = await db.get_all_auto_sell_events()
+    triggered = {
+        (int(event["rule_id"]), str(event["position_id"]))
+        for event in events
+    }
+
+    rules_by_user: dict[int, list[dict[str, Any]]] = {}
+    for rule in rules:
+        rules_by_user.setdefault(int(rule["telegram_id"]), []).append(rule)
+    for user_rules in rules_by_user.values():
+        user_rules.sort(
+            key=lambda rule: _coerce_float(rule.get("target_multiple")) or 0.0
+        )
+
+    requests = [
+        (
+            str(position.get("token_address") or ""),
+            str(position.get("chain_id") or ""),
+            str(position.get("pair_address") or ""),
+        )
+        for position in positions
+    ]
+    prices = await fetch_current_prices(requests)
+
+    for position in positions:
+        telegram_id = int(position["telegram_id"])
+        position_id = str(position["id"])
+        user_rules = rules_by_user.get(telegram_id)
+        if not user_rules:
+            continue
+
+        current_price = prices.get(
+            _price_key(position.get("chain_id"), position.get("pair_address"))
+        )
+        if current_price is None or current_price <= 0:
+            continue
+
+        avg_entry = _coerce_float(position.get("avg_entry_price")) or 0.0
+        if avg_entry <= 0:
+            continue
+
+        for rule in user_rules:
+            rule_id = int(rule["id"])
+            trigger_key = (rule_id, position_id)
+            if trigger_key in triggered:
+                continue
+
+            multiple = _coerce_float(rule.get("target_multiple")) or 0.0
+            percent = _coerce_float(rule.get("sell_percent")) or 0.0
+            if multiple <= 1 or percent <= 0:
+                continue
+            if current_price < avg_entry * multiple:
+                continue
+
+            try:
+                fill = await db.execute_paper_auto_sell(
+                    telegram_id,
+                    rule_id,
+                    position_id,
+                    current_price,
+                    PAPER_FEE_RATE,
+                    PAPER_SLIPPAGE_BPS,
+                )
+            except db.PaperTradingError as exc:
+                if exc.code == "rule_already_triggered":
+                    triggered.add(trigger_key)
+                    continue
+                if exc.code == "position_not_found":
+                    break
+                logger.warning(
+                    "Auto-sell rule %s failed for position %s: %s",
+                    rule_id,
+                    position_id,
+                    exc.message,
+                )
+                stats["auto_sell_errors"] += 1
+                continue
+            except Exception:  # noqa: BLE001 - isolate one bad rule
+                logger.exception(
+                    "Unexpected auto-sell failure for rule %s position %s",
+                    rule_id,
+                    position_id,
+                )
+                stats["auto_sell_errors"] += 1
+                continue
+
+            triggered.add(trigger_key)
+            stats["auto_sells"] += 1
+
+            symbol = _clean_text(
+                fill.get("symbol") or position.get("symbol") or "Token", 30
+            )
+            status = str(fill.get("position_status") or "open")
+            text = (
+                f"🎯 Auto-sell triggered: {symbol}\n\n"
+                f"Rule: {multiple:g}x · sell {percent:g}%\n"
+                f"Trigger price: {_format_price(current_price)}\n"
+                f"Sold: {_format_quantity(fill.get('quantity'))}\n"
+                f"Proceeds: {_format_money(fill.get('cash_amount_usd'))}\n"
+                f"Fee: {_format_money(fill.get('fee_usd'))}\n"
+                f"Realized P&L: {_format_money(fill.get('realized_pnl_usd'))}\n"
+                f"Position: {'Closed' if status == 'closed' else 'Still open'}"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=telegram_id,
+                    text=text,
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "💼 View portfolio",
+                                    callback_data="paper:portfolio",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+            except TelegramError:
+                logger.exception(
+                    "Could not send auto-sell notification to %s", telegram_id
+                )
+
+            if status == "closed":
+                break
+
+    return stats
+
+
 async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
     """Scan every active user's filter and send all matching alerts."""
 
@@ -2285,6 +2691,9 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
         "active_users": 0,
         "matches": 0,
         "alerts_sent": 0,
+        "auto_buys": 0,
+        "auto_sells": 0,
+        "auto_sell_errors": 0,
         "errors": 0,
     }
 
@@ -2302,6 +2711,21 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
         if telegram_id is None or not isinstance(filter_data, dict):
             stats["errors"] += 1
             continue
+
+        paper_account: dict[str, Any] | None = None
+        try:
+            paper_account = await db.get_paper_account(int(telegram_id))
+        except Exception:  # noqa: BLE001 - auto-buy is optional
+            logger.exception("Could not load paper account for %s", telegram_id)
+
+        auto_buy_enabled = bool(
+            paper_account and paper_account.get("auto_buy_enabled")
+        )
+        auto_buy_amount = (
+            _coerce_float(paper_account.get("auto_buy_amount"))
+            if paper_account
+            else None
+        )
 
         try:
             matches = await scan_dexscreener(filter_data, int(telegram_id))
@@ -2332,6 +2756,7 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
                         telegram_id,
                     )
 
+            sent = False
             try:
                 await send_alert(
                     context,
@@ -2340,6 +2765,7 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
                     alert_id=alert_id,
                 )
                 stats["alerts_sent"] += 1
+                sent = True
             except TelegramError:
                 logger.exception("Could not send alert to user %s", telegram_id)
                 stats["errors"] += 1
@@ -2348,6 +2774,36 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
                     "Unexpected alert error for user %s", telegram_id
                 )
                 stats["errors"] += 1
+
+            if (
+                sent
+                and alert_id is not None
+                and auto_buy_enabled
+                and auto_buy_amount is not None
+                and auto_buy_amount > 0
+            ):
+                try:
+                    bought = await _execute_paper_buy(
+                        context,
+                        int(telegram_id),
+                        alert_id,
+                        auto_buy_amount,
+                        auto=True,
+                    )
+                    if bought:
+                        stats["auto_buys"] += 1
+                except Exception:  # noqa: BLE001 - keep scanning
+                    logger.exception(
+                        "Auto-buy failed for user %s", telegram_id
+                    )
+
+    try:
+        auto_stats = await _process_auto_sells(context)
+        stats["auto_sells"] = auto_stats["auto_sells"]
+        stats["auto_sell_errors"] = auto_stats["auto_sell_errors"]
+    except Exception:  # noqa: BLE001 - do not fail the whole scan
+        logger.exception("Auto-sell processing failed")
+        stats["auto_sell_errors"] += 1
 
     logger.info("Scan complete: %s", stats)
     return stats

@@ -137,9 +137,17 @@ CREATE TABLE IF NOT EXISTS public.paper_accounts (
                       CHECK (cash_balance >= 0),
     total_deposited   NUMERIC(18, 2) NOT NULL DEFAULT 1000
                       CHECK (total_deposited >= 0),
+    auto_buy_enabled  BOOLEAN NOT NULL DEFAULT FALSE,
+    auto_buy_amount   NUMERIC(18, 2) NOT NULL DEFAULT 25,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Upgrade accounts created before auto-buy support.
+ALTER TABLE public.paper_accounts
+    ADD COLUMN IF NOT EXISTS auto_buy_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE public.paper_accounts
+    ADD COLUMN IF NOT EXISTS auto_buy_amount NUMERIC(18, 2) NOT NULL DEFAULT 25;
 
 -- ----------------------------------------------------------------------------
 -- paper_alerts
@@ -234,6 +242,48 @@ CREATE TABLE IF NOT EXISTS public.paper_deposits (
 );
 
 -- ----------------------------------------------------------------------------
+-- paper_auto_sell_rules
+-- Multiple take-profit rules per user.  Percentages are applied to the
+-- remaining position quantity when a rule triggers.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.paper_auto_sell_rules (
+    id              BIGSERIAL PRIMARY KEY,
+    telegram_id     BIGINT NOT NULL
+                    REFERENCES public.users (telegram_id) ON DELETE CASCADE,
+    target_multiple NUMERIC(10, 4) NOT NULL
+                    CHECK (target_multiple > 1),
+    sell_percent    NUMERIC(5, 2) NOT NULL
+                    CHECK (sell_percent > 0 AND sell_percent <= 100),
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (telegram_id, target_multiple)
+);
+
+-- ----------------------------------------------------------------------------
+-- paper_auto_sell_events
+-- One execution per rule and position. Events are cleared automatically when a
+-- fully closed position is reopened by a new paper buy.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.paper_auto_sell_events (
+    id               BIGSERIAL PRIMARY KEY,
+    rule_id          BIGINT NOT NULL
+                     REFERENCES public.paper_auto_sell_rules (id)
+                     ON DELETE CASCADE,
+    position_id      UUID NOT NULL
+                     REFERENCES public.paper_positions (id)
+                     ON DELETE CASCADE,
+    telegram_id      BIGINT NOT NULL
+                     REFERENCES public.users (telegram_id)
+                     ON DELETE CASCADE,
+    target_multiple  NUMERIC(10, 4) NOT NULL,
+    trigger_price    NUMERIC(38, 18) NOT NULL,
+    quantity_sold    NUMERIC(38, 18) NOT NULL,
+    realized_pnl_usd NUMERIC(18, 2) NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (rule_id, position_id)
+);
+
+-- ----------------------------------------------------------------------------
 -- Indexes
 -- ----------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS filters_telegram_id_idx
@@ -265,6 +315,12 @@ CREATE INDEX IF NOT EXISTS paper_fills_telegram_created_idx
 
 CREATE INDEX IF NOT EXISTS paper_deposits_telegram_created_idx
     ON public.paper_deposits (telegram_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS paper_auto_sell_rules_telegram_idx
+    ON public.paper_auto_sell_rules (telegram_id, target_multiple);
+
+CREATE INDEX IF NOT EXISTS paper_auto_sell_events_position_idx
+    ON public.paper_auto_sell_events (position_id, rule_id);
 
 -- ============================================================================
 -- Paper-trading functions
@@ -312,7 +368,9 @@ BEGIN
         'telegram_id', v_account.telegram_id,
         'starting_balance', v_account.starting_balance,
         'cash_balance', v_account.cash_balance,
-        'total_deposited', v_account.total_deposited
+        'total_deposited', v_account.total_deposited,
+        'auto_buy_enabled', v_account.auto_buy_enabled,
+        'auto_buy_amount', v_account.auto_buy_amount
     );
 END;
 $$;
@@ -401,6 +459,47 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.paper_set_auto_buy(
+    p_telegram_id BIGINT,
+    p_enabled BOOLEAN,
+    p_amount NUMERIC DEFAULT NULL
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_account public.paper_accounts%ROWTYPE;
+    v_amount NUMERIC(18, 2);
+BEGIN
+    IF p_enabled IS NULL THEN
+        RAISE EXCEPTION 'invalid_amount';
+    END IF;
+
+    IF p_amount IS NOT NULL THEN
+        v_amount := ROUND(p_amount, 2);
+        IF v_amount IS NULL OR v_amount < 1 OR v_amount > 1000000 THEN
+            RAISE EXCEPTION 'invalid_amount';
+        END IF;
+    END IF;
+
+    UPDATE public.paper_accounts
+    SET auto_buy_enabled = p_enabled,
+        auto_buy_amount = COALESCE(v_amount, auto_buy_amount),
+        updated_at = NOW()
+    WHERE telegram_id = p_telegram_id
+    RETURNING * INTO v_account;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'account_not_found';
+    END IF;
+
+    RETURN jsonb_build_object(
+        'telegram_id', v_account.telegram_id,
+        'auto_buy_enabled', v_account.auto_buy_enabled,
+        'auto_buy_amount', v_account.auto_buy_amount
+    );
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.paper_reset(
     p_telegram_id BIGINT,
     p_balance NUMERIC DEFAULT 1000
@@ -458,7 +557,9 @@ AS $$
 DECLARE
     v_alert public.paper_alerts%ROWTYPE;
     v_account public.paper_accounts%ROWTYPE;
+    v_existing public.paper_positions%ROWTYPE;
     v_position public.paper_positions%ROWTYPE;
+    v_is_reopen BOOLEAN := FALSE;
     v_amount NUMERIC(18, 2);
     v_fee NUMERIC(18, 2);
     v_net NUMERIC(18, 2);
@@ -508,6 +609,17 @@ BEGIN
         RAISE EXCEPTION 'insufficient_funds';
     END IF;
 
+    SELECT * INTO v_existing
+    FROM public.paper_positions
+    WHERE telegram_id = p_telegram_id
+      AND chain_id = v_alert.chain_id
+      AND token_address = v_alert.token_address
+    FOR UPDATE;
+
+    IF FOUND AND (v_existing.status = 'closed' OR v_existing.quantity <= 0) THEN
+        v_is_reopen := TRUE;
+    END IF;
+
     v_fee := ROUND(v_amount * p_fee_rate, 2);
     v_net := v_amount - v_fee;
     IF v_net <= 0 THEN
@@ -555,6 +667,11 @@ BEGIN
         END,
         updated_at = NOW()
     RETURNING * INTO v_position;
+
+    IF v_is_reopen THEN
+        DELETE FROM public.paper_auto_sell_events
+        WHERE position_id = v_position.id;
+    END IF;
 
     INSERT INTO public.paper_fills (
         telegram_id, position_id, alert_id, side, symbol, chain_id,
@@ -732,6 +849,71 @@ BEGIN
         'position_quantity', v_position.quantity,
         'position_status', v_position.status,
         'fraction', v_fraction
+    );
+END;
+$$;
+
+
+CREATE OR REPLACE FUNCTION public.paper_auto_sell(
+    p_telegram_id BIGINT,
+    p_rule_id BIGINT,
+    p_position_id UUID,
+    p_market_price NUMERIC,
+    p_fee_rate NUMERIC DEFAULT 0.005,
+    p_slippage_bps INTEGER DEFAULT 200
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_rule public.paper_auto_sell_rules%ROWTYPE;
+    v_result JSONB;
+BEGIN
+    SELECT * INTO v_rule
+    FROM public.paper_auto_sell_rules
+    WHERE id = p_rule_id
+      AND telegram_id = p_telegram_id
+      AND enabled = TRUE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'rule_not_found';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM public.paper_auto_sell_events
+        WHERE rule_id = p_rule_id
+          AND position_id = p_position_id
+    ) THEN
+        RAISE EXCEPTION 'rule_already_triggered';
+    END IF;
+
+    v_result := public.paper_sell(
+        p_telegram_id,
+        p_position_id,
+        v_rule.sell_percent / 100.0,
+        p_market_price,
+        p_fee_rate,
+        p_slippage_bps
+    );
+
+    INSERT INTO public.paper_auto_sell_events (
+        rule_id, position_id, telegram_id, target_multiple,
+        trigger_price, quantity_sold, realized_pnl_usd
+    )
+    VALUES (
+        p_rule_id,
+        p_position_id,
+        p_telegram_id,
+        v_rule.target_multiple,
+        p_market_price,
+        (v_result->>'quantity')::NUMERIC,
+        (v_result->>'realized_pnl_usd')::NUMERIC
+    );
+
+    RETURN v_result || jsonb_build_object(
+        'rule_id', p_rule_id,
+        'target_multiple', v_rule.target_multiple,
+        'sell_percent', v_rule.sell_percent
     );
 END;
 $$;
