@@ -92,6 +92,13 @@ PENDING_PAPER_RESET: dict[int, float] = {}
 
 TIMEFRAMES = ("5M", "1H", "6H", "24H")
 
+REQUIREMENT_LABELS = {
+    "req_profile": "Profile",
+    "req_boosted": "Boosted",
+    "req_ads": "Ads",
+    "req_launchpad": "Launchpad",
+}
+
 CHAIN_LABELS = {
     "solana": "Solana",
     "ethereum": "Ethereum",
@@ -477,11 +484,20 @@ def _main_menu_text(filter_data: dict[str, Any]) -> str:
     ]
     chain_text = ", ".join(chains) if chains else "None selected"
     timeframe = filter_data.get("timeframe") or "24H"
+    active_requirements = [
+        label
+        for field, label in REQUIREMENT_LABELS.items()
+        if filter_data.get(field)
+    ]
+    requirement_text = (
+        ", ".join(active_requirements) if active_requirements else "None"
+    )
 
     return (
         "🎛 Filter Menu\n\n"
         f"Chains: {chain_text}\n"
-        f"Timeframe: {timeframe}\n\n"
+        f"Timeframe: {timeframe}\n"
+        f"Requirements: {requirement_text}\n\n"
         "Choose a category to edit."
     )
 
@@ -500,6 +516,11 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
                     "📈 Buys / Sells", callback_data="menu:bs"
                 ),
                 InlineKeyboardButton("👁 View Active", callback_data="menu:view"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🧩 Requirements", callback_data="menu:req"
+                )
             ],
         ]
     )
@@ -632,6 +653,36 @@ def _chains_menu_keyboard(
         chain_buttons[index : index + 2]
         for index in range(0, len(chain_buttons), 2)
     ]
+    rows.append(
+        [InlineKeyboardButton("« Back", callback_data="menu:main")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _requirements_menu_text(filter_data: dict[str, Any]) -> str:
+    return (
+        "🧩 Requirements\n\n"
+        "These mirror DexScreener's Profile, Boosted, Ads, and Launchpad "
+        "global toggles.\n\n"
+        "Only enable the same toggles you use on DexScreener; enabling all "
+        "four can be very restrictive."
+    )
+
+
+def _requirements_menu_keyboard(
+    filter_data: dict[str, Any],
+) -> InlineKeyboardMarkup:
+    rows = []
+    for field, label in REQUIREMENT_LABELS.items():
+        marker = "✅ " if filter_data.get(field) else "⬜ "
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{marker}{label}",
+                    callback_data=f"req:{field}",
+                )
+            ]
+        )
     rows.append(
         [InlineKeyboardButton("« Back", callback_data="menu:main")]
     )
@@ -2259,6 +2310,33 @@ async def callback_handler(
             )
             return
 
+        if data == "menu:req":
+            await _safe_edit(
+                query,
+                _requirements_menu_text(filter_data),
+                _requirements_menu_keyboard(filter_data),
+            )
+            return
+
+        if data.startswith("req:"):
+            field = data.split(":", 1)[1]
+            if field not in REQUIREMENT_LABELS:
+                await _safe_edit(query, "⚠️ Unknown requirement.")
+                return
+            updated = await db.update_filter(
+                str(filter_data["id"]),
+                telegram_id,
+                {field: not bool(filter_data.get(field))},
+            )
+            if updated is None:
+                raise RuntimeError("Filter update returned no row")
+            await _safe_edit(
+                query,
+                _requirements_menu_text(updated),
+                _requirements_menu_keyboard(updated),
+            )
+            return
+
         if data.startswith("chain:"):
             chain = data.split(":", 1)[1].strip().lower()
             if chain not in CHAIN_LABELS:
@@ -2458,6 +2536,8 @@ async def send_alert(
     chat_id: int,
     match: dict[str, Any],
     alert_id: int | None = None,
+    filter_name: str | None = None,
+    filter_data: dict[str, Any] | None = None,
 ) -> None:
     """Format and send one token alert as Telegram Markdown."""
 
@@ -2493,17 +2573,66 @@ async def send_alert(
     chain = str(pair.get("chainId") or "unknown")
     pair_address = str(pair.get("pairAddress") or "")
 
+    active_filter = filter_data or {}
+    timeframe_label = str(active_filter.get("timeframe") or "24H").upper()
+    timeframe_key = {
+        "5M": "m5",
+        "1H": "h1",
+        "6H": "h6",
+        "24H": "h24",
+    }.get(timeframe_label, "h24")
+
+    volume_data = pair.get("volume")
+    volume = (
+        _coerce_float(volume_data.get(timeframe_key))
+        if isinstance(volume_data, dict)
+        else None
+    )
+    txns_data = pair.get("txns")
+    timeframe_txns = (
+        txns_data.get(timeframe_key)
+        if isinstance(txns_data, dict)
+        else None
+    )
+    buys = (
+        _coerce_float(timeframe_txns.get("buys"))
+        if isinstance(timeframe_txns, dict)
+        else None
+    )
+    sells = (
+        _coerce_float(timeframe_txns.get("sells"))
+        if isinstance(timeframe_txns, dict)
+        else None
+    )
+
     url = str(pair.get("url") or "").strip()
     if not url:
         url = f"https://dexscreener.com/{chain}/{pair_address}"
 
+    buys_text = f"{int(buys):,}" if buys is not None else "N/A"
+    sells_text = f"{int(sells):,}" if sells is not None else "N/A"
+    active_requirements = [
+        label
+        for field, label in REQUIREMENT_LABELS.items()
+        if active_filter.get(field)
+    ]
+    requirements_text = (
+        ", ".join(active_requirements) if active_requirements else "None"
+    )
+
     text = (
         "🚀 *New Token Match*\n\n"
+        f"*Filter:* {_escape_markdown(filter_name or 'Default')}\n"
+        f"*Requirements:* {_escape_markdown(requirements_text)}\n"
         f"*Token:* {_escape_markdown(token_display)}\n"
         f"*Chain:* {_escape_markdown(chain)}\n"
         f"*Price:* {_escape_markdown(_format_price(price))}\n"
         f"*Liquidity:* {_escape_markdown(_format_money(liquidity))}\n"
         f"*MCAP:* {_escape_markdown(_format_money(mcap))}\n"
+        f"*Volume ({_escape_markdown(timeframe_label)}):* "
+        f"{_escape_markdown(_format_money(volume))}\n"
+        f"*Buys/Sells ({_escape_markdown(timeframe_label)}):* "
+        f"{_escape_markdown(buys_text)} / {_escape_markdown(sells_text)}\n"
         f"*Age:* {_escape_markdown(_format_age(pair))}\n\n"
         f"[Open on DexScreener]({url})"
     )
@@ -2519,7 +2648,7 @@ async def send_alert(
             [
                 [
                     InlineKeyboardButton(
-                        f"🧪 Paper ${amount:g}",
+                        f"🧪 ${amount:g}",
                         callback_data=f"pb:{alert_id}:{amount:g}",
                     )
                     for amount in PAPER_BUY_PRESETS
@@ -2763,6 +2892,8 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
                     int(telegram_id),
                     match,
                     alert_id=alert_id,
+                    filter_name=str(filter_data.get("name") or "Default"),
+                    filter_data=filter_data,
                 )
                 stats["alerts_sent"] += 1
                 sent = True

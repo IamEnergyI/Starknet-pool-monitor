@@ -206,6 +206,16 @@ def build_screener_url(
     if address_suffix:
         params.append(("filters[baseTokenSuffixes][0]", address_suffix))
 
+    # Match DexScreener's Profile / Boosted / Ads / Launchpad toggles.
+    if filter_data.get("req_profile"):
+        params.append(("filters[enhancedTokenInfo]", "true"))
+    if filter_data.get("req_boosted"):
+        params.append(("filters[activeBoosts][min]", "1"))
+    if filter_data.get("req_ads"):
+        params.append(("filters[recentPurchasedImpressions][min]", "1"))
+    if filter_data.get("req_launchpad"):
+        params.append(("filters[launchpadProgress][min]", "1"))
+
     query = urlencode(params)
     return (
         f"{SCREENER_WS_HOST}{SCREENER_WS_PATH}/"
