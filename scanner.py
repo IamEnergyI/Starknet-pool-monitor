@@ -65,6 +65,8 @@ GECKO_NETWORKS = {
     "moonbeam": "moonbeam",
     "fantom": "ftm",
     "ftm": "ftm",
+    "starknet": "starknet-alpha",
+    "robinhood": "robinhood",
 }
 
 TIMEFRAME_TO_GECKO = {

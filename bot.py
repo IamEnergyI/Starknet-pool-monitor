@@ -59,6 +59,8 @@ CHAIN_LABELS = {
     "base": "Base",
     "arbitrum": "Arbitrum",
     "polygon": "Polygon",
+    "starknet": "Starknet",
+    "robinhood": "Robinhood",
 }
 
 NUMERIC_FIELDS: dict[str, dict[str, Any]] = {
