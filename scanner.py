@@ -1,10 +1,10 @@
 """DexScreener discovery and GeckoTerminal verification.
 
-Discovery uses DexScreener's latest token profiles and boosts, which surface
-tokens that developers are actively promoting.  GeckoTerminal is only called
-for tokens that survive the cheap, local filters.  Gecko failures are
-deliberately "fail open": the token is returned with an explicit warning so
-that a temporary third-party outage does not silently disable all alerts.
+Discovery primarily uses DexScreener's own screener feed with the same filter
+parameters as its website.  If that internal feed is unavailable, the bot
+falls back to the latest token profiles and boosts.  GeckoTerminal is used for
+the fallback path; screener matches already contain DexScreener's own
+transaction counts and do not need a second verification source.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from urllib.parse import quote
 import httpx
 
 from database import is_token_recently_sent, mark_token_as_sent
+from dexscreener_screener import ScreenerUnavailable, fetch_screener_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,40 @@ def _passes_core_filters(
     if max_change is not None and (
         price_change is None or price_change > max_change
     ):
+        return False
+
+    # Buys/sells come from the same DexScreener pair snapshot.  The screener
+    # applies these server-side, while the promoted-token fallback needs the
+    # local check before it reaches GeckoTerminal.
+    txns_data = pair.get("txns")
+    timeframe_txns = (
+        txns_data.get(dex_timeframe) if isinstance(txns_data, dict) else None
+    )
+    buys = (
+        _as_float(timeframe_txns.get("buys"))
+        if isinstance(timeframe_txns, dict)
+        else None
+    )
+    sells = (
+        _as_float(timeframe_txns.get("sells"))
+        if isinstance(timeframe_txns, dict)
+        else None
+    )
+
+    min_buys = _as_float(filter_data.get("min_buys"))
+    if min_buys is not None and (buys is None or buys < min_buys):
+        return False
+
+    max_buys = _as_float(filter_data.get("max_buys"))
+    if max_buys is not None and (buys is None or buys > max_buys):
+        return False
+
+    min_sells = _as_float(filter_data.get("min_sells"))
+    if min_sells is not None and (sells is None or sells < min_sells):
+        return False
+
+    max_sells = _as_float(filter_data.get("max_sells"))
+    if max_sells is not None and (sells is None or sells > max_sells):
         return False
 
     return True
@@ -496,6 +531,75 @@ async def _verify_with_geckoterminal(
     return True, None
 
 
+async def _process_pairs(
+    client: httpx.AsyncClient | None,
+    pairs: list[dict[str, Any]],
+    filter_data: dict[str, Any],
+    telegram_id: int,
+    *,
+    verify_with_gecko: bool,
+    fallback_warning: str | None,
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+
+    for pair in pairs:
+        if not _passes_core_filters(pair, filter_data):
+            continue
+
+        token_address = _token_address(pair)
+        if not token_address:
+            continue
+
+        try:
+            already_sent = await is_token_recently_sent(
+                telegram_id, token_address
+            )
+        except Exception:  # noqa: BLE001 - a DB hiccup should not stop the scan
+            logger.exception(
+                "Duplicate check failed for %s; continuing", token_address
+            )
+            already_sent = False
+
+        if already_sent:
+            continue
+
+        warning = fallback_warning
+        if verify_with_gecko:
+            if client is None:
+                continue
+            passed, gecko_warning = await _verify_with_geckoterminal(
+                client, pair, filter_data
+            )
+            if not passed:
+                continue
+            if gecko_warning:
+                warning = (
+                    f"{warning}\n{gecko_warning}"
+                    if warning
+                    else gecko_warning
+                )
+
+        chain_id = str(pair.get("chainId") or "")
+        try:
+            await mark_token_as_sent(telegram_id, token_address, chain_id)
+        except Exception:  # noqa: BLE001 - still alert if marking fails
+            logger.exception(
+                "Failed to mark %s as sent; alert will still be emitted",
+                token_address,
+            )
+
+        matches.append({"pair": pair, "warning": warning})
+        base_token = pair.get("baseToken")
+        symbol = (
+            base_token.get("symbol", "?")
+            if isinstance(base_token, dict)
+            else "?"
+        )
+        logger.info("Match: %s (%s:%s)", symbol, chain_id, token_address)
+
+    return matches
+
+
 async def scan_dexscreener(
     filter_data: dict[str, Any] | None,
     telegram_id: int,
@@ -504,15 +608,47 @@ async def scan_dexscreener(
 
     Each match is ``{"pair": <raw DexScreener pair>, "warning": <str|None>}``.
     Duplicate suppression is scoped to the supplied Telegram user.
+
+    The primary path mirrors DexScreener's screener filters.  If the internal
+    screener feed is unavailable, the scanner falls back to the latest token
+    profiles and boosts and retains the GeckoTerminal verification step.
     """
 
     if not isinstance(filter_data, dict) or not filter_data:
         return []
 
     telegram_id = int(telegram_id)
-    matches: list[dict[str, Any]] = []
+    fallback_warning = (
+        "⚠️ DexScreener screener unavailable; using promoted-token fallback."
+    )
 
     try:
+        try:
+            screener_pairs = await fetch_screener_pairs(filter_data)
+        except ScreenerUnavailable as exc:
+            logger.warning(
+                "DexScreener screener failed; falling back to profiles/boosts: %s",
+                exc,
+            )
+        except Exception:  # noqa: BLE001 - fallback must remain available
+            logger.exception(
+                "Unexpected DexScreener screener failure; using fallback"
+            )
+        else:
+            logger.info(
+                "DexScreener screener returned %s candidate pairs",
+                len(screener_pairs),
+            )
+            return await _process_pairs(
+                None,
+                screener_pairs,
+                filter_data,
+                telegram_id,
+                verify_with_gecko=False,
+                fallback_warning=None,
+            )
+
+        # Fallback: latest profiles + boosts through the public API.
         async with httpx.AsyncClient(
             timeout=REQUEST_TIMEOUT,
             headers={"User-Agent": USER_AGENT},
@@ -521,69 +657,28 @@ async def scan_dexscreener(
             token_addresses = await _fetch_latest_token_addresses(client)
             pairs = await _fetch_pairs_by_addresses(client, token_addresses)
             logger.info(
-                "DexScreener returned %s pairs for %s promoted tokens",
+                "Fallback discovery returned %s pairs for %s promoted tokens",
                 len(pairs),
                 len(token_addresses),
             )
-
-            for pair in pairs:
-                if not _passes_core_filters(pair, filter_data):
-                    continue
-
-                token_address = _token_address(pair)
-                if not token_address:
-                    continue
-
-                try:
-                    already_sent = await is_token_recently_sent(
-                        telegram_id, token_address
-                    )
-                except Exception:  # noqa: BLE001 - a DB hiccup should not stop the scan
-                    logger.exception(
-                        "Duplicate check failed for %s; continuing", token_address
-                    )
-                    already_sent = False
-
-                if already_sent:
-                    continue
-
-                passed, warning = await _verify_with_geckoterminal(
-                    client, pair, filter_data
-                )
-                if not passed:
-                    continue
-
-                chain_id = str(pair.get("chainId") or "")
-                try:
-                    await mark_token_as_sent(
-                        telegram_id, token_address, chain_id
-                    )
-                except Exception:  # noqa: BLE001 - still alert if marking fails
-                    logger.exception(
-                        "Failed to mark %s as sent; alert will still be emitted",
-                        token_address,
-                    )
-
-                matches.append({"pair": pair, "warning": warning})
-                base_token = pair.get("baseToken")
-                symbol = (
-                    base_token.get("symbol", "?")
-                    if isinstance(base_token, dict)
-                    else "?"
-                )
-                logger.info(
-                    "Match: %s (%s:%s)", symbol, chain_id, token_address
-                )
+            return await _process_pairs(
+                client,
+                pairs,
+                filter_data,
+                telegram_id,
+                verify_with_gecko=True,
+                fallback_warning=fallback_warning,
+            )
 
     except httpx.TimeoutException:
-        logger.warning("DexScreener request timed out")
+        logger.warning("DexScreener fallback request timed out")
     except httpx.HTTPStatusError as exc:
         logger.warning(
-            "DexScreener returned HTTP %s", exc.response.status_code
+            "DexScreener fallback returned HTTP %s", exc.response.status_code
         )
     except httpx.HTTPError as exc:
-        logger.warning("DexScreener request failed: %s", exc)
+        logger.warning("DexScreener fallback request failed: %s", exc)
     except Exception:  # noqa: BLE001 - never let one scan crash the scheduler
         logger.exception("Unexpected scanner failure")
 
-    return matches
+    return []

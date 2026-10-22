@@ -1081,7 +1081,46 @@ async def _edit_portfolio(
 def _paper_error_text(exc: Exception) -> str:
     if isinstance(exc, db.PaperTradingError):
         return exc.message
-    logger.exception("Unexpected paper-trading error")
+
+    message = str(exc).lower()
+    logger.error("Paper-trading error: %s", exc)
+
+    setup_markers = (
+        "could not find the function",
+        "schema cache",
+        "pgrst202",
+        "undefined function",
+        "undefined table",
+        "does not exist",
+        "relation \"paper_",
+    )
+    if any(marker in message for marker in setup_markers):
+        return (
+            "⚠️ Paper trading is not set up in Supabase yet.\n\n"
+            "Run the updated supabase_schema.sql in the Supabase SQL Editor, "
+            "then wait a few seconds and try again. The file also reloads the "
+            "PostgREST schema cache."
+        )
+
+    access_markers = (
+        "permission denied",
+        "row-level security",
+        "violates row-level security",
+        "invalid api key",
+        "jwt",
+        "unauthorized",
+        "no api key",
+    )
+    if any(marker in message for marker in access_markers):
+        return (
+            "⚠️ Supabase rejected the paper-trading request.\n\n"
+            "Check that SUPABASE_KEY is the project's service-role key and "
+            "that the Supabase URL matches the project where you ran the schema."
+        )
+
+    if "timeout" in message or "connection" in message:
+        return "⚠️ The database connection timed out. Please try again."
+
     return "⚠️ The paper trade could not be completed. Please try again."
 
 
@@ -1603,11 +1642,9 @@ async def start(
     try:
         await db.ensure_user(user.id)
         await _ensure_paper_account(user.id)
-    except Exception:
+    except Exception as exc:
         logger.exception("Could not create user %s", user.id)
-        await message.reply_text(
-            "⚠️ I could not reach the database. Please try again shortly."
-        )
+        await message.reply_text(_paper_error_text(exc))
         return
 
     await message.reply_text(
@@ -1682,11 +1719,9 @@ async def portfolio_command(
 
     try:
         await _show_portfolio_message(message, user.id)
-    except Exception:
+    except Exception as exc:
         logger.exception("Could not load portfolio for %s", user.id)
-        await message.reply_text(
-            "⚠️ I could not load your paper portfolio. Please try again."
-        )
+        await message.reply_text(_paper_error_text(exc))
 
 
 async def history_command(
@@ -1707,11 +1742,9 @@ async def history_command(
 
     try:
         text = await _history_text(user.id)
-    except Exception:
+    except Exception as exc:
         logger.exception("Could not load paper history for %s", user.id)
-        await message.reply_text(
-            "⚠️ I could not load your paper trade history."
-        )
+        await message.reply_text(_paper_error_text(exc))
         return
 
     await message.reply_text(
