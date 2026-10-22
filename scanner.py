@@ -1,8 +1,9 @@
 """DexScreener discovery and GeckoTerminal verification.
 
-The MVP uses DexScreener's search endpoint for discovery and only calls
-GeckoTerminal for tokens that survive the cheap, local filters.  Gecko failures
-are deliberately "fail open": the token is returned with an explicit warning so
+Discovery uses DexScreener's latest token profiles and boosts, which surface
+tokens that developers are actively promoting.  GeckoTerminal is only called
+for tokens that survive the cheap, local filters.  Gecko failures are
+deliberately "fail open": the token is returned with an explicit warning so
 that a temporary third-party outage does not silently disable all alerts.
 """
 
@@ -11,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import time
 from typing import Any
 from urllib.parse import quote
@@ -22,14 +22,14 @@ from database import is_token_recently_sent, mark_token_as_sent
 
 logger = logging.getLogger(__name__)
 
-DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
+DEXSCREENER_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEXSCREENER_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
+DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens"
 GECKO_POOL_URL = (
     "https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool}"
 )
 
-# DexScreener's search endpoint needs a search term.  "token" is the broad MVP
-# discovery term requested by the project specification.
-SEARCH_TERM = (os.environ.get("DEXSCREENER_SEARCH_TERM") or "token").strip() or "token"
+MAX_DISCOVERY_ADDRESSES = 30
 
 REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 USER_AGENT = "CryptoScannerBot/1.0 (+https://render.com)"
@@ -233,10 +233,70 @@ def _passes_core_filters(
     return True
 
 
-async def _fetch_pairs(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+async def _fetch_latest_token_addresses(
+    client: httpx.AsyncClient,
+) -> list[str]:
+    """Fetch promoted token addresses from profiles and boosts.
+
+    Both endpoints return a JSON list whose objects include ``chainId`` and
+    ``tokenAddress``.  If either request fails, discovery is aborted for this
+    scan and an empty list is returned.
+    """
+
+    addresses: list[str] = []
+    fetch_failed = False
+
+    sources = (
+        (DEXSCREENER_PROFILES_URL, "token profiles"),
+        (DEXSCREENER_BOOSTS_URL, "token boosts"),
+    )
+
+    for url, label in sources:
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+
+            if not isinstance(payload, list):
+                raise ValueError(
+                    f"Expected a list, got {type(payload).__name__}"
+                )
+
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                token_address = str(item.get("tokenAddress") or "").strip()
+                if token_address:
+                    addresses.append(token_address)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            logger.warning(
+                "Failed to fetch DexScreener %s (%s): %s",
+                label,
+                type(exc).__name__,
+                exc,
+            )
+            fetch_failed = True
+
+    if fetch_failed:
+        return []
+
+    # dict.fromkeys removes duplicates while preserving discovery order.
+    unique_addresses = list(dict.fromkeys(addresses))
+    return unique_addresses[:MAX_DISCOVERY_ADDRESSES]
+
+
+async def _fetch_pairs_by_addresses(
+    client: httpx.AsyncClient,
+    token_addresses: list[str],
+) -> list[dict[str, Any]]:
+    """Fetch pairs for up to 30 comma-separated token addresses."""
+
+    if not token_addresses:
+        return []
+
+    comma_separated_addresses = ",".join(token_addresses)
     response = await client.get(
-        DEXSCREENER_SEARCH_URL,
-        params={"q": SEARCH_TERM},
+        f"{DEXSCREENER_TOKENS_URL}/{comma_separated_addresses}"
     )
     response.raise_for_status()
     payload = response.json()
@@ -351,11 +411,12 @@ async def scan_dexscreener(
             headers={"User-Agent": USER_AGENT},
             follow_redirects=True,
         ) as client:
-            pairs = await _fetch_pairs(client)
+            token_addresses = await _fetch_latest_token_addresses(client)
+            pairs = await _fetch_pairs_by_addresses(client, token_addresses)
             logger.info(
-                "DexScreener returned %s pairs for search term %r",
+                "DexScreener returned %s pairs for %s promoted tokens",
                 len(pairs),
-                SEARCH_TERM,
+                len(token_addresses),
             )
 
             for pair in pairs:
