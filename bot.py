@@ -328,19 +328,27 @@ def _clean_text(value: Any, limit: int = 120) -> str:
     return text[:limit]
 
 
-def _format_money(value: Any) -> str:
+def _format_money(value: Any, *, compact: bool = False) -> str:
+    """Format a USD amount with thousands separators.
+
+    Account and trade amounts are always shown in full (``$1,000.00``).
+    ``compact`` abbreviates large values (``$1.0K``) for dense market-data
+    lines such as liquidity, market cap, and volume in alerts.
+    """
+
     number = _coerce_float(value)
     if number is None:
         return "N/A"
 
     sign = "-" if number < 0 else ""
     absolute = abs(number)
-    if absolute >= 1_000_000_000:
-        return f"{sign}${absolute / 1_000_000_000:.2f}B"
-    if absolute >= 1_000_000:
-        return f"{sign}${absolute / 1_000_000:.2f}M"
-    if absolute >= 1_000:
-        return f"{sign}${absolute / 1_000:.1f}K"
+    if compact:
+        if absolute >= 1_000_000_000:
+            return f"{sign}${absolute / 1_000_000_000:.2f}B"
+        if absolute >= 1_000_000:
+            return f"{sign}${absolute / 1_000_000:.2f}M"
+        if absolute >= 1_000:
+            return f"{sign}${absolute / 1_000:.1f}K"
     return f"{sign}${absolute:,.2f}"
 
 
@@ -364,7 +372,7 @@ def _format_field_value(field: str, value: Any) -> str:
     if kind == "text":
         return _clean_text(value, 40)
     if kind == "usd":
-        return _format_money(value)
+        return _format_money(value, compact=True)
     if kind == "days":
         number = _coerce_float(value)
         return f"{number:g} d" if number is not None else "Any"
@@ -2627,10 +2635,10 @@ async def send_alert(
         f"*Token:* {_escape_markdown(token_display)}\n"
         f"*Chain:* {_escape_markdown(chain)}\n"
         f"*Price:* {_escape_markdown(_format_price(price))}\n"
-        f"*Liquidity:* {_escape_markdown(_format_money(liquidity))}\n"
-        f"*MCAP:* {_escape_markdown(_format_money(mcap))}\n"
+        f"*Liquidity:* {_escape_markdown(_format_money(liquidity, compact=True))}\n"
+        f"*MCAP:* {_escape_markdown(_format_money(mcap, compact=True))}\n"
         f"*Volume ({_escape_markdown(timeframe_label)}):* "
-        f"{_escape_markdown(_format_money(volume))}\n"
+        f"{_escape_markdown(_format_money(volume, compact=True))}\n"
         f"*Buys/Sells ({_escape_markdown(timeframe_label)}):* "
         f"{_escape_markdown(buys_text)} / {_escape_markdown(sells_text)}\n"
         f"*Age:* {_escape_markdown(_format_age(pair))}\n\n"
