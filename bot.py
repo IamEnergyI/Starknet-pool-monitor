@@ -28,7 +28,12 @@ from telegram.ext import (
 )
 
 import database as db
-from scanner import fetch_current_prices, fetch_pair_price, scan_dexscreener
+from scanner import (
+    fetch_checked_pair_price,
+    fetch_current_prices,
+    fetch_pair_price,
+    scan_dexscreener,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -817,7 +822,15 @@ async def _build_portfolio(telegram_id: int) -> dict[str, Any]:
         )
         for position in open_positions
     ]
-    prices = await fetch_current_prices(requests) if requests else {}
+    references = {
+        _price_key(position.get("chain_id"), position.get("pair_address")): (
+            _coerce_float(position.get("last_price_usd"))
+        )
+        for position in open_positions
+    }
+    prices = (
+        await fetch_current_prices(requests, references) if requests else {}
+    )
 
     priced_positions: list[dict[str, Any]] = []
     positions_value = 0.0
@@ -1191,6 +1204,26 @@ async def _edit_portfolio(
     )
 
 
+def _price_refusal_text(status: str) -> str:
+    """Explain why a paper trade was refused because of a bad price."""
+
+    if status == "source_disagreement":
+        return (
+            "⚠️ Paper trade skipped: DexScreener and GeckoTerminal report "
+            "very different prices for this pool, so the price cannot be "
+            "trusted. Try again in a minute."
+        )
+    if status == "unconfirmed_move":
+        return (
+            "⚠️ Paper trade skipped: the pool price jumped far beyond the "
+            "last known price and only one source confirms it. Try again in "
+            "a minute."
+        )
+    return (
+        "⚠️ I could not get a valid price for this token. Try again shortly."
+    )
+
+
 def _paper_error_text(exc: Exception) -> str:
     if isinstance(exc, db.PaperTradingError):
         return exc.message
@@ -1253,18 +1286,30 @@ async def _execute_paper_buy(
         )
         return False
 
-    price = await fetch_pair_price(
+    alert_price = _coerce_float(alert.get("price_usd"))
+    price, price_status = await fetch_checked_pair_price(
         str(alert.get("token_address") or ""),
         str(alert.get("chain_id") or ""),
         str(alert.get("pair_address") or ""),
+        reference=alert_price,
     )
+    if price is None and price_status in {
+        "source_disagreement",
+        "unconfirmed_move",
+    }:
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text=_price_refusal_text(price_status),
+        )
+        return False
+
     stale = price is None
     if price is None:
-        price = _coerce_float(alert.get("price_usd"))
+        price = alert_price
     if price is None or price <= 0:
         await context.bot.send_message(
             chat_id=telegram_id,
-            text="⚠️ I could not get a valid price for this token. Try again shortly.",
+            text=_price_refusal_text(price_status),
         )
         return False
 
@@ -1337,18 +1382,30 @@ async def _execute_paper_sell(
         )
         return
 
-    price = await fetch_pair_price(
+    last_price = _coerce_float(position.get("last_price_usd"))
+    price, price_status = await fetch_checked_pair_price(
         str(position.get("token_address") or ""),
         str(position.get("chain_id") or ""),
         str(position.get("pair_address") or ""),
+        reference=last_price,
     )
+    if price is None and price_status in {
+        "source_disagreement",
+        "unconfirmed_move",
+    }:
+        await context.bot.send_message(
+            chat_id=telegram_id,
+            text=_price_refusal_text(price_status),
+        )
+        return
+
     stale = price is None
     if price is None:
-        price = _coerce_float(position.get("last_price_usd"))
+        price = last_price
     if price is None or price <= 0:
         await context.bot.send_message(
             chat_id=telegram_id,
-            text="⚠️ I could not get a valid price for this token. Try again shortly.",
+            text=_price_refusal_text(price_status),
         )
         return
 
@@ -2682,7 +2739,11 @@ async def send_alert(
 async def _process_auto_sells(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> dict[str, int]:
-    stats = {"auto_sells": 0, "auto_sell_errors": 0}
+    stats = {
+        "auto_sells": 0,
+        "auto_sell_errors": 0,
+        "price_unavailable": 0,
+    }
 
     positions = await db.get_all_open_paper_positions()
     if not positions:
@@ -2714,7 +2775,13 @@ async def _process_auto_sells(
         )
         for position in positions
     ]
-    prices = await fetch_current_prices(requests)
+    references = {
+        _price_key(position.get("chain_id"), position.get("pair_address")): (
+            _coerce_float(position.get("last_price_usd"))
+        )
+        for position in positions
+    }
+    prices = await fetch_current_prices(requests, references)
 
     for position in positions:
         telegram_id = int(position["telegram_id"])
@@ -2727,6 +2794,7 @@ async def _process_auto_sells(
             _price_key(position.get("chain_id"), position.get("pair_address"))
         )
         if current_price is None or current_price <= 0:
+            stats["price_unavailable"] += 1
             continue
 
         avg_entry = _coerce_float(position.get("avg_entry_price")) or 0.0
@@ -2831,6 +2899,7 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
         "auto_buys": 0,
         "auto_sells": 0,
         "auto_sell_errors": 0,
+        "price_unavailable": 0,
         "errors": 0,
     }
 
@@ -2940,6 +3009,7 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
         auto_stats = await _process_auto_sells(context)
         stats["auto_sells"] = auto_stats["auto_sells"]
         stats["auto_sell_errors"] = auto_stats["auto_sell_errors"]
+        stats["price_unavailable"] = auto_stats["price_unavailable"]
     except Exception:  # noqa: BLE001 - do not fail the whole scan
         logger.exception("Auto-sell processing failed")
         stats["auto_sell_errors"] += 1

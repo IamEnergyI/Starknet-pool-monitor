@@ -9,9 +9,11 @@ transaction counts and do not need a second verification source.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
+import os
 import time
 from typing import Any
 from urllib.parse import quote
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 DEXSCREENER_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens"
+DEXSCREENER_PAIR_URL = "https://api.dexscreener.com/latest/dex/pairs"
 GECKO_POOL_URL = (
     "https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool}"
 )
@@ -34,6 +37,33 @@ MAX_DISCOVERY_ADDRESSES = 30
 
 REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 USER_AGENT = "CryptoScannerBot/1.0 (+https://render.com)"
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r", name, raw)
+        return default
+
+
+# Price-integrity policy.  A fill is only executed on a price that two
+# independent providers agree on, and a single-provider price may not move more
+# than the jump ratio away from the position's last known price.
+PAIR_PRICE_MAX_DEVIATION = min(
+    0.9, max(0.01, _env_float("PRICE_MAX_DEVIATION", 0.20))
+)
+PAIR_PRICE_JUMP_RATIO = max(1.5, _env_float("PRICE_MAX_JUMP_RATIO", 3.0))
+PAIR_PRICE_CACHE_SECONDS = max(
+    0.0, _env_float("PRICE_CACHE_SECONDS", 20.0)
+)
+MAX_CONCURRENT_PRICE_REQUESTS = 4
+
+# (chain, pair) -> (monotonic timestamp, price, status)
+_price_cache: dict[tuple[str, str], tuple[float, float | None, str]] = {}
 
 GECKO_FAILURE_WARNING = (
     "⚠️ GeckoTerminal API failed. Buys/Sells unverified."
@@ -348,92 +378,308 @@ async def _fetch_pairs_by_addresses(
     return [pair for pair in pairs if isinstance(pair, dict)]
 
 
-async def fetch_current_prices(
-    requests: list[tuple[str, str, str]],
-) -> dict[tuple[str, str], float]:
-    """Fetch current USD prices for ``(token, chain, pair)`` requests.
+def _price_key(chain_id: Any, pair_address: Any) -> tuple[str, str]:
+    return (
+        str(chain_id or "").strip().lower(),
+        str(pair_address or "").strip().lower(),
+    )
 
-    Returns a mapping of ``(chain_id_lower, pair_address_lower)`` to price.
-    If the exact pair is missing, the highest-liquidity pair for the same token
-    and chain is used as a fallback.
+
+def _cached_price(
+    key: tuple[str, str],
+) -> tuple[float | None, str] | None:
+    entry = _price_cache.get(key)
+    if entry is None:
+        return None
+    stored_at, price, status = entry
+    if (
+        PAIR_PRICE_CACHE_SECONDS > 0
+        and time.monotonic() - stored_at < PAIR_PRICE_CACHE_SECONDS
+    ):
+        return price, status
+    _price_cache.pop(key, None)
+    return None
+
+
+def _store_price(
+    key: tuple[str, str], price: float | None, status: str
+) -> None:
+    if PAIR_PRICE_CACHE_SECONDS <= 0:
+        return
+    _price_cache[key] = (time.monotonic(), price, status)
+
+
+async def _fetch_dex_pair_price(
+    client: httpx.AsyncClient,
+    chain_id: str,
+    pair_address: str,
+) -> float | None:
+    """Price one exact pool through DexScreener's per-pair endpoint.
+
+    The token endpoint (``/latest/dex/tokens``) is deliberately not used here:
+    it is an aggregate whose price can lag or disagree with the pool it names.
+    """
+
+    if not chain_id or not pair_address:
+        return None
+
+    url = (
+        f"{DEXSCREENER_PAIR_URL}/{quote(chain_id, safe='')}"
+        f"/{quote(pair_address, safe='')}"
+    )
+    response = await client.get(url)
+    response.raise_for_status()
+    payload = response.json()
+
+    pair: Any = None
+    if isinstance(payload, dict):
+        pair = payload.get("pair")
+        if not isinstance(pair, dict):
+            pairs = payload.get("pairs")
+            if isinstance(pairs, list) and pairs:
+                pair = pairs[0]
+    if not isinstance(pair, dict):
+        return None
+
+    # Never accept a response that describes a different pool.
+    returned_pair = str(pair.get("pairAddress") or "").strip().lower()
+    if returned_pair and returned_pair != pair_address.strip().lower():
+        logger.warning(
+            "DexScreener pair lookup for %s returned %s; ignoring",
+            pair_address,
+            returned_pair,
+        )
+        return None
+
+    return _as_float(pair.get("priceUsd"))
+
+
+async def _fetch_gecko_price(
+    client: httpx.AsyncClient,
+    chain_id: str,
+    pair_address: str,
+) -> float | None:
+    """Price the same pool independently through GeckoTerminal."""
+
+    network = GECKO_NETWORKS.get(chain_id, chain_id)
+    if not network or not pair_address:
+        return None
+
+    url = GECKO_POOL_URL.format(
+        network=quote(network, safe=""),
+        pool=quote(pair_address, safe=""),
+    )
+    response = await client.get(url, headers={"Accept": "application/json"})
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    attributes = data.get("attributes") if isinstance(data, dict) else None
+    if not isinstance(attributes, dict):
+        return None
+
+    return _as_float(attributes.get("base_token_price_usd"))
+
+
+async def _source_prices(
+    client: httpx.AsyncClient,
+    chain_id: str,
+    pair_address: str,
+) -> tuple[float | None, float | None]:
+    """Return ``(dexscreener_price, geckoterminal_price)`` independently."""
+
+    results = await asyncio.gather(
+        _fetch_dex_pair_price(client, chain_id, pair_address),
+        _fetch_gecko_price(client, chain_id, pair_address),
+        return_exceptions=True,
+    )
+
+    values: list[float | None] = []
+    for name, result in zip(("DexScreener", "GeckoTerminal"), results):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "%s price lookup failed for %s/%s: %s: %s",
+                name,
+                chain_id,
+                pair_address,
+                type(result).__name__,
+                result,
+            )
+            values.append(None)
+        else:
+            values.append(result)
+    return values[0], values[1]
+
+
+def _combine_price_sources(
+    dex_price: float | None,
+    gecko_price: float | None,
+) -> tuple[float | None, str]:
+    """Combine both providers into one trusted price and a status."""
+
+    if dex_price is not None and gecko_price is not None:
+        high = max(dex_price, gecko_price)
+        low = min(dex_price, gecko_price)
+        if high <= 0:
+            return None, "no_price"
+        if (high - low) / high > PAIR_PRICE_MAX_DEVIATION:
+            logger.warning(
+                "Price sources disagree (%.10g vs %.10g); refusing the price",
+                dex_price,
+                gecko_price,
+            )
+            return None, "source_disagreement"
+        return dex_price, "confirmed"
+
+    if dex_price is not None:
+        return dex_price, "single_source"
+    if gecko_price is not None:
+        return gecko_price, "single_source"
+    return None, "no_price"
+
+
+def _is_unconfirmed_move(
+    price: float | None,
+    status: str,
+    reference: Any,
+) -> bool:
+    """Reject a single-source price that jumps far from the last known price."""
+
+    if price is None or status == "confirmed":
+        return False
+
+    reference_price = _as_float(reference)
+    if reference_price is None or reference_price <= 0:
+        return False
+
+    ratio = price / reference_price
+    return ratio > PAIR_PRICE_JUMP_RATIO or ratio < 1 / PAIR_PRICE_JUMP_RATIO
+
+
+async def resolve_prices(
+    requests: list[tuple[str, str, str]],
+) -> dict[tuple[str, str], tuple[float | None, str]]:
+    """Resolve prices for ``(token, chain, pair)`` requests.
+
+    Each distinct pool is queried once through DexScreener and once through
+    GeckoTerminal.  Results are cached briefly so a portfolio refresh and the
+    auto-sell pass in the same scan do not duplicate requests.
     """
 
     if not requests:
         return {}
 
-    token_addresses = list(
-        dict.fromkeys(
-            str(token).strip()
-            for token, _chain, _pair in requests
-            if str(token).strip()
+    resolved: dict[tuple[str, str], tuple[float | None, str]] = {}
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_PRICE_REQUESTS)
+
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+        follow_redirects=True,
+    ) as client:
+
+        async def resolve_one(
+            chain_id: str, pair_address: str
+        ) -> tuple[tuple[str, str], tuple[float | None, str]]:
+            key = _price_key(chain_id, pair_address)
+            cached = _cached_price(key)
+            if cached is not None:
+                return key, cached
+
+            async with semaphore:
+                dex_price, gecko_price = await _source_prices(
+                    client, chain_id, pair_address
+                )
+            price, status = _combine_price_sources(dex_price, gecko_price)
+            _store_price(key, price, status)
+            return key, (price, status)
+
+        results = await asyncio.gather(
+            *(
+                resolve_one(chain_id, pair_address)
+                for _token, chain_id, pair_address in requests
+            )
         )
-    )
-    if not token_addresses:
+
+    for key, outcome in results:
+        resolved[key] = outcome
+    return resolved
+
+
+async def fetch_current_prices(
+    requests: list[tuple[str, str, str]],
+    references: dict[tuple[str, str], float | None] | None = None,
+) -> dict[tuple[str, str], float]:
+    """Return trusted USD prices keyed by ``(chain_id, pair_address)``.
+
+    Only the exact pool supplied is priced.  Valuing a position through another
+    pool for the same token is unsafe: fragmented tokens can trade at wildly
+    different prices in different pools.
+
+    ``references`` maps a pool key to its last known price; a single-provider
+    price that moves more than ``PAIR_PRICE_JUMP_RATIO`` away from it is
+    discarded rather than used for a fill.
+    """
+
+    if not requests:
         return {}
 
-    pairs: list[dict[str, Any]] = []
-    try:
-        async with httpx.AsyncClient(
-            timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": USER_AGENT},
-            follow_redirects=True,
-        ) as client:
-            for index in range(0, len(token_addresses), MAX_DISCOVERY_ADDRESSES):
-                chunk = token_addresses[index : index + MAX_DISCOVERY_ADDRESSES]
-                pairs.extend(await _fetch_pairs_by_addresses(client, chunk))
-    except Exception as exc:  # noqa: BLE001 - callers can use their last price
-        logger.warning("Could not refresh paper-trade prices: %s", exc)
-        return {}
+    resolved = await resolve_prices(requests)
+    references = references or {}
 
-    prices_by_pair: dict[tuple[str, str], float] = {}
-    best_by_token: dict[tuple[str, str], tuple[float, float]] = {}
-
-    for pair in pairs:
-        price = _as_float(pair.get("priceUsd"))
+    prices: dict[tuple[str, str], float] = {}
+    for _token, chain_id, pair_address in requests:
+        key = _price_key(chain_id, pair_address)
+        price, status = resolved.get(key, (None, "no_price"))
         if price is None:
             continue
-
-        chain_id = str(pair.get("chainId") or "").strip().lower()
-        pair_address = str(pair.get("pairAddress") or "").strip().lower()
-        base_token = pair.get("baseToken")
-        token_address = (
-            str(base_token.get("address") or "").strip().lower()
-            if isinstance(base_token, dict)
-            else ""
-        )
-
-        if pair_address:
-            prices_by_pair[(chain_id, pair_address)] = price
-
-        if token_address:
-            liquidity_data = pair.get("liquidity")
-            liquidity = (
-                _as_float(liquidity_data.get("usd"))
-                if isinstance(liquidity_data, dict)
-                else None
-            ) or 0.0
-            key = (chain_id, token_address)
-            if key not in best_by_token or liquidity > best_by_token[key][0]:
-                best_by_token[key] = (liquidity, price)
-
-    result: dict[tuple[str, str], float] = {}
-    for token_address, chain_id, pair_address in requests:
-        pair_key = (
-            str(chain_id).strip().lower(),
-            str(pair_address).strip().lower(),
-        )
-        price = prices_by_pair.get(pair_key)
-        if price is None:
-            token_key = (
-                str(chain_id).strip().lower(),
-                str(token_address).strip().lower(),
+        if _is_unconfirmed_move(price, status, references.get(key)):
+            logger.warning(
+                "Discarding unconfirmed price for %s/%s: %.10g vs reference %.10g",
+                chain_id,
+                pair_address,
+                price,
+                _as_float(references.get(key)) or 0.0,
             )
-            fallback = best_by_token.get(token_key)
-            price = fallback[1] if fallback else None
-        if price is not None:
-            result[pair_key] = price
+            continue
+        prices[key] = price
 
-    return result
+    return prices
+
+
+async def fetch_checked_pair_price(
+    token_address: str,
+    chain_id: str,
+    pair_address: str,
+    *,
+    reference: float | None = None,
+) -> tuple[float | None, str]:
+    """Return ``(price, status)`` for one pool.
+
+    ``status`` is one of ``confirmed``, ``single_source``,
+    ``source_disagreement``, ``unconfirmed_move``, or ``no_price`` so callers
+    can explain a refusal to the user.
+    """
+
+    resolved = await resolve_prices(
+        [(token_address, chain_id, pair_address)]
+    )
+    key = _price_key(chain_id, pair_address)
+    price, status = resolved.get(key, (None, "no_price"))
+
+    if _is_unconfirmed_move(price, status, reference):
+        logger.warning(
+            "Discarding unconfirmed price for %s/%s: %.10g vs reference %.10g",
+            chain_id,
+            pair_address,
+            price or 0.0,
+            _as_float(reference) or 0.0,
+        )
+        return None, "unconfirmed_move"
+
+    return price, status
 
 
 async def fetch_pair_price(
@@ -443,11 +689,10 @@ async def fetch_pair_price(
 ) -> float | None:
     """Return the current USD price for one token pair."""
 
-    prices = await fetch_current_prices(
-        [(token_address, chain_id, pair_address)]
+    price, _status = await fetch_checked_pair_price(
+        token_address, chain_id, pair_address
     )
-    key = (chain_id.strip().lower(), pair_address.strip().lower())
-    return prices.get(key)
+    return price
 
 
 async def _verify_with_geckoterminal(
