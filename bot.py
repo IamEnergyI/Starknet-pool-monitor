@@ -97,7 +97,7 @@ PENDING_PAPER_RESET: dict[int, float] = {}
 
 # user_id -> monotonic deadline for a pending "sell all" confirmation
 PENDING_SELL_ALL: dict[int, float] = {}
-SELL_ALL_CONFIRM_SECONDS = 120.0
+SELL_ALL_CONFIRM_SECONDS = 300.0
 
 TIMEFRAMES = ("5M", "1H", "6H", "24H")
 
@@ -988,8 +988,13 @@ def _portfolio_text(snapshot: dict[str, Any], page: int = 0) -> str:
     if snapshot["stale_prices"]:
         lines.append("⚠️ Some prices could not be refreshed; last known price used.")
 
+    footer = (
+        "Updated "
+        + datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    )
+
     if not snapshot["open_positions"]:
-        lines.extend(["", "No open paper positions."])
+        lines.extend(["", "No open paper positions.", "", footer])
         return "\n".join(lines)
 
     page, pages, positions = _portfolio_page(snapshot, page)
@@ -1019,7 +1024,9 @@ def _portfolio_text(snapshot: dict[str, Any], page: int = 0) -> str:
             ]
         )
 
-    lines.extend(["", "Tap a position below to sell part or all of it."])
+    lines.extend(
+        ["", "Tap a position below to sell part or all of it.", "", footer]
+    )
     return "\n".join(lines)
 
 
@@ -1634,18 +1641,23 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
         )
         for position in positions
     }
+    await _safe_edit(query, f"⏳ Selling {len(positions)} position(s)…")
+
     prices = await fetch_current_prices(requests, references)
 
     sold = 0
-    skipped = 0
+    skipped: list[str] = []
     proceeds = 0.0
     realized = 0.0
 
     for position in positions:
+        symbol = _clean_text(
+            position.get("symbol") or position.get("name") or "Token", 20
+        )
         key = _price_key(position.get("chain_id"), position.get("pair_address"))
         price = prices.get(key)
         if price is None or price <= 0:
-            skipped += 1
+            skipped.append(f"{symbol} — price unverified")
             continue
 
         try:
@@ -1657,8 +1669,8 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
                 PAPER_FEE_RATE,
                 PAPER_SLIPPAGE_BPS,
             )
-        except db.PaperTradingError:
-            skipped += 1
+        except db.PaperTradingError as exc:
+            skipped.append(f"{symbol} — {_clean_text(exc.message, 40)}")
             continue
         except Exception:  # noqa: BLE001 - one bad position must not stop the rest
             logger.exception(
@@ -1666,7 +1678,7 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
                 position.get("id"),
                 telegram_id,
             )
-            skipped += 1
+            skipped.append(f"{symbol} — temporary error")
             continue
 
         sold += 1
@@ -1674,25 +1686,27 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
         realized += _coerce_float(fill.get("realized_pnl_usd")) or 0.0
 
     if sold == 0:
-        text = (
-            "⚠️ Nothing was sold.\n\n"
-            "No position had a price that two sources agree on. "
-            "Try again in a minute."
-        )
+        lines = ["⚠️ Nothing was sold.", ""]
     else:
-        text = (
-            "✅ Sold all positions\n\n"
-            f"Closed: {sold} position(s)\n"
-            f"Proceeds: {_format_money(proceeds)}\n"
-            f"Realized P&L: {_format_money(realized)}"
-        )
-        if skipped:
-            text += (
-                f"\nSkipped: {skipped} "
-                "(price unavailable or already closed)"
+        lines = [
+            "✅ Sell-all complete",
+            "",
+            f"Closed: {sold} position(s)",
+            f"Proceeds: {_format_money(proceeds)}",
+            f"Realized P&L: {_format_money(realized)}",
+        ]
+
+    if skipped:
+        lines.extend(["", f"Still open ({len(skipped)}):"])
+        lines.extend(f"• {entry}" for entry in skipped[:10])
+        if len(skipped) > 10:
+            lines.append(f"…and {len(skipped) - 10} more")
+        if sold:
+            lines.extend(
+                ["", "Open a position below to sell it individually."]
             )
 
-    await _safe_edit(query, text, portfolio_button)
+    await _safe_edit(query, "\n".join(lines), portfolio_button)
 
 
 async def _prompt_paper_input(
