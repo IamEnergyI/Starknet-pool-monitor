@@ -611,6 +611,24 @@ async def get_paper_fills(
     return _response_rows(response)
 
 
+async def get_position_fills(
+    telegram_id: int,
+    position_id: str,
+) -> list[dict[str, Any]]:
+    """Return every fill for one position, oldest first."""
+
+    response = await _execute(
+        get_supabase()
+        .table("paper_fills")
+        .select("*")
+        .eq("telegram_id", int(telegram_id))
+        .eq("position_id", str(position_id))
+        .order("created_at")
+        .order("id")
+    )
+    return _response_rows(response)
+
+
 async def set_auto_buy(
     telegram_id: int,
     enabled: bool,

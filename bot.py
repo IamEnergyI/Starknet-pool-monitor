@@ -1090,7 +1090,61 @@ def _portfolio_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-def _position_text(position: dict[str, Any], current_price: float | None) -> str:
+def _position_money_stats(
+    position: dict[str, Any], fills: list[dict[str, Any]]
+) -> dict[str, float] | None:
+    """Summarise how much cash went in, came out, and is still invested.
+
+    Buy fills store the gross amount spent (fee included) in
+    ``cash_amount_usd``; sell fills store net proceeds.  A position that was
+    fully sold and later re-bought keeps its fills, so the cycle counter below
+    resets at each full close to describe the position that is open now.
+    """
+
+    if not fills:
+        return None
+
+    invested = 0.0
+    proceeds = 0.0
+    sold_quantity = 0.0
+    cycle_bought = 0.0
+    cycle_quantity = 0.0
+
+    for fill in fills:
+        side = str(fill.get("side") or "").lower()
+        quantity = _coerce_float(fill.get("quantity")) or 0.0
+        cash = _coerce_float(fill.get("cash_amount_usd")) or 0.0
+
+        if side == "buy":
+            invested += cash
+            cycle_bought += quantity
+            cycle_quantity += quantity
+        elif side == "sell":
+            proceeds += cash
+            sold_quantity += quantity
+            cycle_quantity -= quantity
+            if cycle_quantity <= 1e-12:
+                cycle_quantity = 0.0
+                cycle_bought = 0.0
+
+    remaining = _coerce_float(position.get("quantity")) or 0.0
+    left_pct = (
+        remaining / cycle_bought * 100.0 if cycle_bought > 0 else None
+    )
+
+    return {
+        "invested": invested,
+        "proceeds": proceeds,
+        "sold_quantity": sold_quantity,
+        "left_pct": left_pct,
+    }
+
+
+def _position_text(
+    position: dict[str, Any],
+    current_price: float | None,
+    fills: list[dict[str, Any]] | None = None,
+) -> str:
     quantity = _coerce_float(position.get("quantity")) or 0.0
     cost_basis = _coerce_float(position.get("cost_basis_usd")) or 0.0
     entry = _coerce_float(position.get("avg_entry_price")) or 0.0
@@ -1107,28 +1161,63 @@ def _position_text(position: dict[str, Any], current_price: float | None) -> str
         if unrealized is not None and cost_basis > 0
         else None
     )
+    realized = _coerce_float(position.get("realized_pnl_usd")) or 0.0
 
     symbol = _clean_text(
         position.get("symbol") or position.get("name") or "Token", 30
     )
+
+    stats = _position_money_stats(position, fills or [])
+    left_suffix = ""
+    if stats and stats["left_pct"] is not None:
+        left_suffix = f" · {stats['left_pct']:.0f}% of position left"
+
     lines = [
         f"📊 {symbol}",
         "",
         f"Chain: {_chain_display(position.get('chain_id'))}",
-        f"Quantity: {_format_quantity(quantity)}",
-        f"Average entry: {_format_price(entry)}",
-        f"Current price: {_format_price(current)}",
-        f"Cost basis: {_format_money(cost_basis)}",
-        f"Market value: {_format_money(market_value)}",
-        (
-            f"Unrealized P&L: {_format_money(unrealized)} "
-            f"({_format_pct(unrealized_pct)})"
-        ),
-        f"Realized P&L: {_format_money(position.get('realized_pnl_usd'))}",
         f"Opened: {_format_when(position.get('opened_at'))}",
         "",
-        "Sell 25%, 50%, 100%, or a custom percentage.",
+        f"Quantity: {_format_quantity(quantity)}{left_suffix}",
+        f"Average entry: {_format_price(entry)}",
+        f"Current price: {_format_price(current)}",
+        f"Value left: {_format_money(market_value)}",
+        f"Cost basis left: {_format_money(cost_basis)}",
     ]
+
+    if stats:
+        lines.extend(
+            [
+                "",
+                f"Invested: {_format_money(stats['invested'])}",
+                (
+                    f"Sold: {_format_quantity(stats['sold_quantity'])} "
+                    f"for {_format_money(stats['proceeds'])}"
+                ),
+            ]
+        )
+
+    lines.extend(
+        [
+            f"Realized P&L: {_format_money(realized)}",
+            (
+                f"Unrealized P&L: {_format_money(unrealized)} "
+                f"({_format_pct(unrealized_pct)})"
+            ),
+        ]
+    )
+
+    if stats and stats["invested"] > 0:
+        total_pnl = realized + (unrealized or 0.0)
+        total_pct = total_pnl / stats["invested"] * 100.0
+        lines.append(
+            f"Total P&L: {_format_money(total_pnl)} "
+            f"({_format_pct(total_pct)} on invested)"
+        )
+
+    lines.extend(
+        ["", "Sell 25%, 50%, 100%, or a custom percentage."]
+    )
     if current_price is None:
         lines.append("⚠️ Live price unavailable; last known price used.")
     return "\n".join(lines)
@@ -1802,9 +1891,16 @@ async def _handle_paper_callback(
                 str(position.get("chain_id") or ""),
                 str(position.get("pair_address") or ""),
             )
+            try:
+                fills = await db.get_position_fills(telegram_id, position_id)
+            except Exception:  # noqa: BLE001 - the screen still works without it
+                logger.exception(
+                    "Could not load fills for position %s", position_id
+                )
+                fills = []
             await _safe_edit(
                 query,
-                _position_text(position, price),
+                _position_text(position, price, fills),
                 _position_keyboard(position),
             )
             return
