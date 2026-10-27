@@ -95,6 +95,10 @@ WAITING_FOR_PAPER_VALUE: dict[int, dict[str, Any]] = {}
 # user_id -> requested reset balance awaiting confirmation
 PENDING_PAPER_RESET: dict[int, float] = {}
 
+# user_id -> monotonic deadline for a pending "sell all" confirmation
+PENDING_SELL_ALL: dict[int, float] = {}
+SELL_ALL_CONFIRM_SECONDS = 120.0
+
 TIMEFRAMES = ("5M", "1H", "6H", "24H")
 
 REQUIREMENT_LABELS = {
@@ -1059,6 +1063,16 @@ def _portfolio_keyboard(
         if navigation:
             rows.append(navigation)
 
+    if snapshot["open_positions"]:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"💸 Sell all ({len(snapshot['open_positions'])})",
+                    callback_data="paper:sellall",
+                )
+            ]
+        )
+
     rows.append(
         [
             InlineKeyboardButton(
@@ -1455,6 +1469,143 @@ async def _execute_paper_sell(
     )
 
 
+async def _prompt_sell_all(query: Any, telegram_id: int) -> None:
+    """Ask for confirmation before selling every open position."""
+
+    snapshot = await _build_portfolio(telegram_id)
+    positions = snapshot["open_positions"]
+    if not positions:
+        await _safe_edit(query, "📭 There are no open positions to sell.")
+        return
+
+    PENDING_SELL_ALL[telegram_id] = time.monotonic() + SELL_ALL_CONFIRM_SECONDS
+    await _safe_edit(
+        query,
+        "💸 Sell all positions?\n\n"
+        f"Positions: {len(positions)}\n"
+        f"Estimated value: {_format_money(snapshot['positions_value'])}\n\n"
+        "This sells 100% of every open position at the current market price. "
+        "Positions whose price cannot be verified are skipped.",
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Sell everything",
+                        callback_data="paper:sellall:yes",
+                    ),
+                    InlineKeyboardButton(
+                        "✖ Cancel", callback_data="paper:sellall:no"
+                    ),
+                ]
+            ]
+        ),
+    )
+
+
+async def _execute_sell_all(query: Any, telegram_id: int) -> None:
+    """Sell 100% of every open position and report a single summary."""
+
+    portfolio_button = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("« Portfolio", callback_data="paper:portfolio")]]
+    )
+
+    deadline = PENDING_SELL_ALL.pop(telegram_id, 0.0)
+    if not deadline or time.monotonic() > deadline:
+        await _safe_edit(
+            query,
+            "⌛ That confirmation expired. Tap “Sell all” again.",
+            portfolio_button,
+        )
+        return
+
+    positions = [
+        position
+        for position in await db.get_paper_positions(
+            telegram_id, status="open"
+        )
+        if (_coerce_float(position.get("quantity")) or 0.0) > 0
+    ]
+    if not positions:
+        await _safe_edit(
+            query, "📭 There are no open positions to sell.", portfolio_button
+        )
+        return
+
+    requests = [
+        (
+            str(position.get("token_address") or ""),
+            str(position.get("chain_id") or ""),
+            str(position.get("pair_address") or ""),
+        )
+        for position in positions
+    ]
+    references = {
+        _price_key(position.get("chain_id"), position.get("pair_address")): (
+            _coerce_float(position.get("last_price_usd"))
+        )
+        for position in positions
+    }
+    prices = await fetch_current_prices(requests, references)
+
+    sold = 0
+    skipped = 0
+    proceeds = 0.0
+    realized = 0.0
+
+    for position in positions:
+        key = _price_key(position.get("chain_id"), position.get("pair_address"))
+        price = prices.get(key)
+        if price is None or price <= 0:
+            skipped += 1
+            continue
+
+        try:
+            fill = await db.execute_paper_sell(
+                telegram_id,
+                str(position["id"]),
+                1.0,
+                price,
+                PAPER_FEE_RATE,
+                PAPER_SLIPPAGE_BPS,
+            )
+        except db.PaperTradingError:
+            skipped += 1
+            continue
+        except Exception:  # noqa: BLE001 - one bad position must not stop the rest
+            logger.exception(
+                "Sell-all failed for position %s of user %s",
+                position.get("id"),
+                telegram_id,
+            )
+            skipped += 1
+            continue
+
+        sold += 1
+        proceeds += _coerce_float(fill.get("cash_amount_usd")) or 0.0
+        realized += _coerce_float(fill.get("realized_pnl_usd")) or 0.0
+
+    if sold == 0:
+        text = (
+            "⚠️ Nothing was sold.\n\n"
+            "No position had a price that two sources agree on. "
+            "Try again in a minute."
+        )
+    else:
+        text = (
+            "✅ Sold all positions\n\n"
+            f"Closed: {sold} position(s)\n"
+            f"Proceeds: {_format_money(proceeds)}\n"
+            f"Realized P&L: {_format_money(realized)}"
+        )
+        if skipped:
+            text += (
+                f"\nSkipped: {skipped} "
+                "(price unavailable or already closed)"
+            )
+
+    await _safe_edit(query, text, portfolio_button)
+
+
 async def _prompt_paper_input(
     context: ContextTypes.DEFAULT_TYPE,
     telegram_id: int,
@@ -1517,6 +1668,19 @@ async def _handle_paper_callback(
         WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
         if data == "paper:portfolio":
             await _edit_portfolio(query, telegram_id)
+            return
+
+        if data == "paper:sellall":
+            await _prompt_sell_all(query, telegram_id)
+            return
+
+        if data == "paper:sellall:yes":
+            await _execute_sell_all(query, telegram_id)
+            return
+
+        if data == "paper:sellall:no":
+            PENDING_SELL_ALL.pop(telegram_id, None)
+            await _safe_edit(query, "✖ Sell-all cancelled.")
             return
 
         if data.startswith("pf:refresh"):
