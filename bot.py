@@ -32,6 +32,7 @@ from scanner import (
     fetch_checked_pair_price,
     fetch_current_prices,
     fetch_pair_price,
+    lookup_token,
     scan_dexscreener,
 )
 
@@ -2104,6 +2105,7 @@ async def start(
     await message.reply_text(
         "👋 Welcome to the Crypto Scanner Bot.\n\n"
         "Use /filter to configure your token filters.\n"
+        "Paste any token contract address to see its details and paper-buy it.\n"
         f"Your paper balance starts at {_format_money(PAPER_STARTING_BALANCE)}.\n"
         "Use /setbalance before your first trade to choose another amount.\n"
         "Use /portfolio to see PnL and /addfunds to top up fake cash anytime.\n"
@@ -2828,6 +2830,10 @@ async def handle_waiting_value(
 
     state = WAITING_FOR_VALUE.get(user.id)
     if state is None:
+        # No pending edit: a bare contract address triggers a token lookup.
+        address = _extract_token_address(message.text)
+        if address is not None:
+            await _handle_token_lookup(update, context, address)
         return
 
     field = state.get("field")
@@ -2868,6 +2874,212 @@ async def handle_waiting_value(
 # ---------------------------------------------------------------------------
 # Alerts and scan orchestration
 # ---------------------------------------------------------------------------
+
+
+EVM_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+
+def _extract_token_address(text: str) -> str | None:
+    """Return a contract address when the whole message is one."""
+
+    candidate = (text or "").strip()
+    if not candidate or len(candidate) > 64:
+        return None
+    if EVM_ADDRESS_RE.fullmatch(candidate):
+        return candidate
+    if SOLANA_ADDRESS_RE.fullmatch(candidate):
+        return candidate
+    return None
+
+
+def _lookup_text(
+    pair: dict[str, Any],
+    status: str,
+    warning: str | None,
+    can_buy: bool,
+) -> str:
+    """Format a pasted-address lookup as Telegram Markdown."""
+
+    base_token = pair.get("baseToken")
+    if not isinstance(base_token, dict):
+        base_token = {}
+
+    name = _clean_text(
+        base_token.get("name") or base_token.get("symbol") or "Unknown Token"
+    )
+    symbol = _clean_text(base_token.get("symbol"))
+    token_display = name
+    if symbol and symbol.lower() != name.lower():
+        token_display = f"{name} ({symbol})"
+
+    chain_id = str(pair.get("chainId") or "")
+    dex_id = str(pair.get("dexId") or "")
+    pair_address = str(pair.get("pairAddress") or "")
+
+    liquidity_data = pair.get("liquidity")
+    liquidity = (
+        _coerce_float(liquidity_data.get("usd"))
+        if isinstance(liquidity_data, dict)
+        else None
+    )
+    mcap = _coerce_float(pair.get("marketCap"))
+    if mcap is None:
+        mcap = _coerce_float(pair.get("fdv"))
+
+    volume_data = pair.get("volume")
+    volume = (
+        _coerce_float(volume_data.get("h24"))
+        if isinstance(volume_data, dict)
+        else None
+    )
+    txns_data = pair.get("txns")
+    day_txns = txns_data.get("h24") if isinstance(txns_data, dict) else None
+    buys = (
+        _coerce_float(day_txns.get("buys"))
+        if isinstance(day_txns, dict)
+        else None
+    )
+    sells = (
+        _coerce_float(day_txns.get("sells"))
+        if isinstance(day_txns, dict)
+        else None
+    )
+    buys_text = f"{int(buys):,}" if buys is not None else "N/A"
+    sells_text = f"{int(sells):,}" if sells is not None else "N/A"
+
+    url = str(pair.get("url") or "").strip()
+    if not url:
+        url = f"https://dexscreener.com/{chain_id}/{pair_address}"
+
+    chain_text = _chain_display(chain_id)
+    if dex_id:
+        chain_text = f"{chain_text} · {dex_id.title()}"
+
+    lines = [
+        "🔍 *Token Lookup*",
+        "",
+        f"*Token:* {_escape_markdown(token_display)}",
+        f"*Chain:* {_escape_markdown(chain_text)}",
+        f"*Price:* {_escape_markdown(_format_price(pair.get('priceUsd')))}",
+        (
+            "*Liquidity:* "
+            f"{_escape_markdown(_format_money(liquidity, compact=True))}"
+        ),
+        f"*MCAP:* {_escape_markdown(_format_money(mcap, compact=True))}",
+        (
+            "*Volume (24H):* "
+            f"{_escape_markdown(_format_money(volume, compact=True))}"
+        ),
+        f"*Buys/Sells (24H):* {_escape_markdown(buys_text)} / "
+        f"{_escape_markdown(sells_text)}",
+        f"*Age:* {_escape_markdown(_format_age(pair))}",
+    ]
+
+    pair_count = int(_coerce_float(pair.get("lookup_pair_count")) or 0)
+    if pair_count > 1:
+        lines.append(
+            f"*Pools found:* {pair_count} (showing the most liquid)"
+        )
+
+    lines.extend(["", f"[Open on DexScreener]({url})"])
+
+    if warning:
+        lines.extend(["", _escape_markdown(warning)])
+    elif can_buy:
+        lines.extend(["", "_Paper buy buttons expire in 1 hour._"])
+
+    return "\n".join(lines)
+
+
+def _lookup_keyboard(alert_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"🧪 ${amount:g}",
+                    callback_data=f"pb:{alert_id}:{amount:g}",
+                )
+                for amount in PAPER_BUY_PRESETS
+            ],
+            [
+                InlineKeyboardButton(
+                    "Custom amount", callback_data=f"pb:{alert_id}:custom"
+                )
+            ],
+        ]
+    )
+
+
+async def _handle_token_lookup(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    token_address: str,
+) -> None:
+    """Look up a pasted contract address and offer paper buys."""
+
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    telegram_id = int(user.id)
+    try:
+        pair, status = await lookup_token(token_address)
+    except Exception:  # noqa: BLE001 - a lookup must never crash the handler
+        logger.exception("Token lookup crashed for %s", token_address)
+        await message.reply_text(
+            "⚠️ I could not look that token up. Please try again shortly."
+        )
+        return
+
+    if pair is None:
+        await message.reply_text(
+            "🔍 No DexScreener pair found for that address.\n\n"
+            "Make sure it is a token contract address — not a wallet, a pair "
+            "address, or a transaction signature."
+        )
+        return
+
+    warning = None
+    buyable = status in {"confirmed", "single_source"}
+    if status == "source_disagreement":
+        warning = (
+            "⚠️ Price sources disagree for this pool, so paper buying is "
+            "disabled until they agree."
+        )
+    elif status == "no_price":
+        warning = (
+            "⚠️ No verified live price for this pool, so paper buying is "
+            "disabled."
+        )
+
+    alert_id: int | None = None
+    if buyable:
+        try:
+            alert = await db.create_paper_alert(
+                telegram_id, None, pair, warning
+            )
+            if alert is not None:
+                alert_id = int(alert["id"])
+        except Exception:  # noqa: BLE001 - details are still worth showing
+            logger.exception(
+                "Could not create lookup alert for user %s", telegram_id
+            )
+
+    text = _lookup_text(pair, status, warning, alert_id is not None)
+    markup = _lookup_keyboard(alert_id) if alert_id is not None else None
+
+    try:
+        await message.reply_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+            reply_markup=markup,
+        )
+    except TelegramError:
+        logger.exception("Could not send token lookup for %s", token_address)
+        await message.reply_text(text, disable_web_page_preview=True)
 
 
 async def send_alert(

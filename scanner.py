@@ -60,6 +60,8 @@ PAIR_PRICE_JUMP_RATIO = max(1.5, _env_float("PRICE_MAX_JUMP_RATIO", 3.0))
 PAIR_PRICE_CACHE_SECONDS = max(
     0.0, _env_float("PRICE_CACHE_SECONDS", 20.0)
 )
+# Hard cap per pool so one slow provider cannot stall a whole sell-all.
+PRICE_LOOKUP_TIMEOUT = max(2.0, _env_float("PRICE_LOOKUP_TIMEOUT", 6.0))
 MAX_CONCURRENT_PRICE_REQUESTS = 4
 
 # (chain, pair) -> (monotonic timestamp, price, status)
@@ -409,12 +411,12 @@ def _store_price(
     _price_cache[key] = (time.monotonic(), price, status)
 
 
-async def _fetch_dex_pair_price(
+async def _fetch_dex_pair_snapshot(
     client: httpx.AsyncClient,
     chain_id: str,
     pair_address: str,
-) -> float | None:
-    """Price one exact pool through DexScreener's per-pair endpoint.
+) -> dict[str, Any] | None:
+    """Return DexScreener's authoritative snapshot for one exact pool.
 
     The token endpoint (``/latest/dex/tokens``) is deliberately not used here:
     it is an aggregate whose price can lag or disagree with the pool it names.
@@ -451,7 +453,16 @@ async def _fetch_dex_pair_price(
         )
         return None
 
-    return _as_float(pair.get("priceUsd"))
+    return pair
+
+
+async def _fetch_dex_pair_price(
+    client: httpx.AsyncClient,
+    chain_id: str,
+    pair_address: str,
+) -> float | None:
+    pair = await _fetch_dex_pair_snapshot(client, chain_id, pair_address)
+    return _as_float(pair.get("priceUsd")) if pair else None
 
 
 async def _fetch_gecko_price(
@@ -589,9 +600,18 @@ async def resolve_prices(
                 return key, cached
 
             async with semaphore:
-                dex_price, gecko_price = await _source_prices(
-                    client, chain_id, pair_address
-                )
+                try:
+                    dex_price, gecko_price = await asyncio.wait_for(
+                        _source_prices(client, chain_id, pair_address),
+                        timeout=PRICE_LOOKUP_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Price lookup timed out for %s/%s",
+                        chain_id,
+                        pair_address,
+                    )
+                    dex_price, gecko_price = None, None
             price, status = _combine_price_sources(dex_price, gecko_price)
             _store_price(key, price, status)
             return key, (price, status)
@@ -693,6 +713,86 @@ async def fetch_pair_price(
         token_address, chain_id, pair_address
     )
     return price
+
+
+def _pair_liquidity(pair: dict[str, Any]) -> float:
+    liquidity = pair.get("liquidity")
+    value = (
+        _as_float(liquidity.get("usd"))
+        if isinstance(liquidity, dict)
+        else None
+    )
+    return value or 0.0
+
+
+def _token_matches(pair: dict[str, Any], token_address: str) -> bool:
+    base_token = pair.get("baseToken")
+    if not isinstance(base_token, dict):
+        return False
+    address = str(base_token.get("address") or "").strip()
+    if not address:
+        return False
+    return address == token_address or address.lower() == token_address.lower()
+
+
+async def lookup_token(
+    token_address: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Resolve a pasted contract address to its most liquid pool.
+
+    Discovery uses the token endpoint (the only way to go from a mint address
+    to its pools), but every displayed number then comes from the authoritative
+    per-pair snapshot, and the price must be corroborated by GeckoTerminal.
+
+    Returns ``(pair, status)``; ``pair`` carries the DexScreener snapshot plus
+    a ``lookup_pair_count`` hint.  ``status`` matches the price resolver's
+    vocabulary so callers can decide whether buying is safe.
+    """
+
+    token_address = (token_address or "").strip()
+    if not token_address:
+        return None, "not_found"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": USER_AGENT},
+            follow_redirects=True,
+        ) as client:
+            pairs = await _fetch_pairs_by_addresses(client, [token_address])
+            candidates = [
+                pair
+                for pair in pairs
+                if _token_matches(pair, token_address)
+                and str(pair.get("chainId") or "").strip()
+                and str(pair.get("pairAddress") or "").strip()
+            ]
+            if not candidates:
+                return None, "not_found"
+
+            candidates.sort(key=_pair_liquidity, reverse=True)
+            chosen = candidates[0]
+            chain_id = str(chosen.get("chainId") or "").strip().lower()
+            pair_address = str(chosen.get("pairAddress") or "").strip()
+
+            snapshot = await _fetch_dex_pair_snapshot(
+                client, chain_id, pair_address
+            )
+            gecko_price = await _fetch_gecko_price(client, chain_id, pair_address)
+    except Exception as exc:  # noqa: BLE001 - lookup must never crash a handler
+        logger.warning("Token lookup failed for %s: %s", token_address, exc)
+        return None, "error"
+
+    pair = dict(snapshot or chosen)
+    # Without the per-pair snapshot there is no authoritative price at all.
+    dex_price = _as_float(snapshot.get("priceUsd")) if snapshot else None
+    price, status = _combine_price_sources(dex_price, gecko_price)
+    if price is not None:
+        pair["priceUsd"] = price
+
+    pair["lookup_pair_count"] = len(candidates)
+    pair["lookup_token_address"] = token_address
+    return pair, status
 
 
 async def _verify_with_geckoterminal(
