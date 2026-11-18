@@ -381,26 +381,37 @@ async def _rpc(function_name: str, params: dict[str, Any]) -> dict[str, Any]:
     return {"value": data}
 
 
-async def is_token_recently_sent(
-    telegram_id: int, token_address: str
-) -> bool:
-    """Return ``True`` if this user was sent the token in the last 72 hours."""
+async def get_recently_sent_tokens(telegram_id: int) -> set[str]:
+    """Return every token address sent to this user inside the dedupe window.
 
-    token_address = (token_address or "").strip()
-    if not token_address:
-        return False
+    One paginated read replaces one query per candidate, which matters now that
+    a scan can consider a thousand pairs.
+    """
 
+    telegram_id = int(telegram_id)
     cutoff = (datetime.now(timezone.utc) - _DUPLICATE_WINDOW).isoformat()
-    response = await _execute(
-        get_supabase()
-        .table("sent_tokens")
-        .select("token_address")
-        .eq("telegram_id", int(telegram_id))
-        .eq("token_address", token_address)
-        .gte("sent_at", cutoff)
-        .limit(1)
-    )
-    return bool(_response_rows(response))
+    addresses: set[str] = set()
+    offset = 0
+
+    while True:
+        response = await _execute(
+            get_supabase()
+            .table("sent_tokens")
+            .select("token_address")
+            .eq("telegram_id", telegram_id)
+            .gte("sent_at", cutoff)
+            .range(offset, offset + _PAGE_SIZE - 1)
+        )
+        rows = _response_rows(response)
+        for row in rows:
+            address = str(row.get("token_address") or "").strip()
+            if address:
+                addresses.add(address)
+        if len(rows) < _PAGE_SIZE:
+            break
+        offset += _PAGE_SIZE
+
+    return addresses
 
 
 async def mark_token_as_sent(

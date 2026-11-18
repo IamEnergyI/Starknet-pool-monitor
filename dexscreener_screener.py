@@ -48,7 +48,10 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-SCREENER_MAX_PAGES = max(1, min(20, _env_int("SCREENER_MAX_PAGES", 3)))
+SCREENER_MAX_PAGES = max(1, min(30, _env_int("SCREENER_MAX_PAGES", 10)))
+SCREENER_PAGE_CONCURRENCY = max(
+    1, min(6, _env_int("SCREENER_PAGE_CONCURRENCY", 3))
+)
 SCREENER_TIMEOUT_SECONDS = max(
     5.0, _env_float("SCREENER_TIMEOUT_SECONDS", 15.0)
 )
@@ -107,13 +110,16 @@ def _chain_filter_values(filter_data: dict[str, Any]) -> list[str]:
 def build_screener_url(
     filter_data: dict[str, Any],
     page: int = 1,
+    *,
+    rank_key: str = "trendingScoreH6",
+    rank_order: str = "desc",
 ) -> str:
     """Build the screener WebSocket URL from the bot's filter data."""
 
     timeframe = _normalize_timeframe(filter_data)
     params: list[tuple[str, str]] = [
-        ("rankBy[key]", "trendingScoreH6"),
-        ("rankBy[order]", "desc"),
+        ("rankBy[key]", rank_key),
+        ("rankBy[order]", rank_order),
     ]
 
     for index, chain in enumerate(_chain_filter_values(filter_data)):
@@ -467,8 +473,13 @@ def _parse_channel_frame(
 async def _fetch_page(
     filter_data: dict[str, Any],
     page: int,
+    *,
+    rank_key: str = "trendingScoreH6",
+    rank_order: str = "desc",
 ) -> tuple[list[dict[str, Any]], int]:
-    url = build_screener_url(filter_data, page)
+    url = build_screener_url(
+        filter_data, page, rank_key=rank_key, rank_order=rank_order
+    )
     deadline = time.monotonic() + SCREENER_TIMEOUT_SECONDS
 
     try:
@@ -523,7 +534,22 @@ async def fetch_screener_pairs(
         return []
 
     first_pairs, total = await _fetch_page(filter_data, 1)
-    pairs: list[dict[str, Any]] = list(first_pairs)
+    pairs: list[dict[str, Any]] = []
+
+    # A brand-new token can sit far down the trending ranking, so take the
+    # newest matches first.  This is what makes freshly created pairs get
+    # noticed even when a broad filter matches a thousand tokens, and it means
+    # the alert budget goes to the freshest opportunities.
+    try:
+        newest_pairs, _newest_total = await _fetch_page(
+            filter_data, 1, rank_key="pairAge", rank_order="asc"
+        )
+        pairs.extend(newest_pairs)
+        logger.info("Newest-first pass added %s pairs", len(newest_pairs))
+    except ScreenerUnavailable:
+        logger.warning("Newest-first screener pass failed; continuing")
+
+    pairs.extend(first_pairs)
 
     total_pages = max(
         1, math.ceil(total / SCREENER_PAGE_SIZE)
@@ -537,20 +563,40 @@ async def fetch_screener_pairs(
             total_pages,
         )
 
-    for page in range(2, pages_to_fetch + 1):
-        try:
-            page_pairs, _page_total = await _fetch_page(filter_data, page)
-        except ScreenerUnavailable:
-            logger.warning(
-                "Screener page %s failed; using %s already-fetched pairs",
-                page,
-                len(pairs),
-                exc_info=True,
+    # Remaining pages are independent connections, so fetch a few at a time.
+    # Sequentially this would dominate the scan once a filter matches hundreds
+    # of pairs.
+    if pages_to_fetch > 1:
+        semaphore = asyncio.Semaphore(SCREENER_PAGE_CONCURRENCY)
+
+        async def fetch_page(page: int) -> tuple[int, list[dict[str, Any]]]:
+            async with semaphore:
+                for attempt in (1, 2):
+                    try:
+                        page_pairs, _page_total = await _fetch_page(
+                            filter_data, page
+                        )
+                        return page, page_pairs
+                    except ScreenerUnavailable:
+                        if attempt == 2:
+                            logger.warning(
+                                "Screener page %s failed twice; skipping",
+                                page,
+                            )
+                            return page, []
+                        await asyncio.sleep(0.4)
+            return page, []
+
+        results = await asyncio.gather(
+            *(
+                fetch_page(page)
+                for page in range(2, pages_to_fetch + 1)
             )
-            break
-        if not page_pairs:
-            break
-        pairs.extend(page_pairs)
+        )
+        for page, page_pairs in sorted(results):
+            if not page_pairs:
+                continue
+            pairs.extend(page_pairs)
 
     allowed_chains = {
         str(chain).strip().lower()

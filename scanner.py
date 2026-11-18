@@ -21,7 +21,10 @@ from urllib.parse import quote
 
 import httpx
 
-from database import is_token_recently_sent, mark_token_as_sent
+from database import (
+    get_recently_sent_tokens,
+    mark_token_as_sent,
+)
 from dexscreener_screener import ScreenerUnavailable, fetch_screener_pairs
 
 logger = logging.getLogger(__name__)
@@ -1052,12 +1055,26 @@ async def _process_pairs(
     fallback_warning: str | None,
 ) -> list[dict[str, Any]]:
     matches: list[dict[str, Any]] = []
+    skipped_sent = 0
+    rejected_snapshot = 0
 
-    for pair in pairs:
+    try:
+        sent_tokens = await get_recently_sent_tokens(telegram_id)
+    except Exception:  # noqa: BLE001 - a DB hiccup should not stop the scan
+        logger.exception(
+            "Could not load sent tokens for %s; duplicates are possible",
+            telegram_id,
+        )
+        sent_tokens = set()
+
+    for index, pair in enumerate(pairs):
         if len(matches) >= MAX_ALERTS_PER_SCAN:
             logger.info(
-                "Per-scan alert cap (%s) reached; deferring the rest",
+                "Per-scan alert cap (%s) reached after %s of %s candidates; "
+                "the rest are deferred to the next scan",
                 MAX_ALERTS_PER_SCAN,
+                index,
+                len(pairs),
             )
             break
 
@@ -1068,17 +1085,8 @@ async def _process_pairs(
         if not token_address:
             continue
 
-        try:
-            already_sent = await is_token_recently_sent(
-                telegram_id, token_address
-            )
-        except Exception:  # noqa: BLE001 - a DB hiccup should not stop the scan
-            logger.exception(
-                "Duplicate check failed for %s; continuing", token_address
-            )
-            already_sent = False
-
-        if already_sent:
+        if token_address in sent_tokens:
+            skipped_sent += 1
             continue
 
         # Re-validate against the authoritative pool snapshot.  A stale
@@ -1102,6 +1110,7 @@ async def _process_pairs(
 
             if snapshot is not None:
                 if not _passes_core_filters(snapshot, filter_data):
+                    rejected_snapshot += 1
                     logger.info(
                         "Skipping %s: fails filters on the authoritative "
                         "pair snapshot",
@@ -1135,6 +1144,7 @@ async def _process_pairs(
                 "Failed to mark %s as sent; alert will still be emitted",
                 token_address,
             )
+        sent_tokens.add(token_address)
 
         matches.append({"pair": pair, "warning": warning})
         base_token = pair.get("baseToken")
@@ -1145,6 +1155,14 @@ async def _process_pairs(
         )
         logger.info("Match: %s (%s:%s)", symbol, chain_id, token_address)
 
+    logger.info(
+        "Scan pass: %s candidates, %s matches, %s already sent, "
+        "%s rejected on re-check",
+        len(pairs),
+        len(matches),
+        skipped_sent,
+        rejected_snapshot,
+    )
     return matches
 
 
