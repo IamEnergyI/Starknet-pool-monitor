@@ -3299,6 +3299,60 @@ async def _handle_token_lookup(
         await message.reply_text(text, disable_web_page_preview=True)
 
 
+def _filter_audit(
+    filter_data: dict[str, Any],
+    pair: dict[str, Any],
+    *,
+    liquidity: float | None,
+    mcap: float | None,
+    volume: float | None,
+    buys: float | None,
+    sells: float | None,
+) -> str:
+    """Show the thresholds this match actually satisfied.
+
+    Printed on every alert so a suspicious alert can be checked against the
+    numbers instead of guessed at.
+    """
+
+    checks: list[str] = []
+
+    min_liquidity = _coerce_float(filter_data.get("min_liquidity"))
+    if min_liquidity is not None:
+        checks.append(
+            f"liq {_format_money(liquidity, compact=True)}"
+            f" ≥ {_format_money(min_liquidity, compact=True)}"
+        )
+
+    max_mcap = _coerce_float(filter_data.get("max_mcap"))
+    if max_mcap is not None:
+        checks.append(
+            f"mcap {_format_money(mcap, compact=True)}"
+            f" ≤ {_format_money(max_mcap, compact=True)}"
+        )
+
+    max_age = _coerce_float(filter_data.get("max_age_days"))
+    if max_age is not None:
+        checks.append(f"age {_format_age(pair)} ≤ {max_age:g}d")
+
+    min_volume = _coerce_float(filter_data.get("min_volume"))
+    if min_volume is not None:
+        checks.append(
+            f"vol {_format_money(volume, compact=True)}"
+            f" ≥ {_format_money(min_volume, compact=True)}"
+        )
+
+    min_buys = _coerce_float(filter_data.get("min_buys"))
+    if min_buys is not None and buys is not None:
+        checks.append(f"buys {int(buys):,} ≥ {min_buys:g}")
+
+    min_sells = _coerce_float(filter_data.get("min_sells"))
+    if min_sells is not None and sells is not None:
+        checks.append(f"sells {int(sells):,} ≥ {min_sells:g}")
+
+    return " · ".join(checks[:3])
+
+
 async def send_alert(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -3388,10 +3442,22 @@ async def send_alert(
         ", ".join(active_requirements) if active_requirements else "None"
     )
 
+    audit = _filter_audit(
+        active_filter,
+        pair,
+        liquidity=liquidity,
+        mcap=mcap,
+        volume=volume,
+        buys=buys,
+        sells=sells,
+    )
+    audit_line = f"*Matched:* {_escape_markdown(audit)}\n" if audit else ""
+
     text = (
         "🚀 *New Token Match*\n\n"
         f"*Filter:* {_escape_markdown(filter_name or 'Default')}\n"
         f"*Requirements:* {_escape_markdown(requirements_text)}\n"
+        f"{audit_line}"
         f"*Token:* {_escape_markdown(token_display)}\n"
         f"*Chain:* {_escape_markdown(chain)}\n"
         f"*Price:* {_escape_markdown(_format_price(price))}\n"

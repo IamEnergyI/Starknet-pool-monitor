@@ -64,6 +64,9 @@ PAIR_PRICE_CACHE_SECONDS = max(
 # Hard cap per pool so one slow provider cannot stall a whole sell-all.
 PRICE_LOOKUP_TIMEOUT = max(2.0, _env_float("PRICE_LOOKUP_TIMEOUT", 6.0))
 MAX_CONCURRENT_PRICE_REQUESTS = 4
+# Alerts per user per scan.  Keeps a sudden wave of matches from flooding the
+# chat (and Telegram's send limits); the rest are picked up on later scans.
+MAX_ALERTS_PER_SCAN = max(1, int(_env_float("MAX_ALERTS_PER_SCAN", 10)))
 # GeckoTerminal's public API allows roughly 30 requests per minute.  Second
 # opinions are only requested for suspicious prices, but the budget is capped
 # so a burst of anomalies cannot burn the whole quota.
@@ -311,6 +314,18 @@ def _passes_core_filters(
     max_sells = _as_float(filter_data.get("max_sells"))
     if max_sells is not None and (sells is None or sells > max_sells):
         return False
+
+    # Boosted is the one requirement flag whose value DexScreener also returns
+    # per pair, so it can be enforced locally as a second line of defence.
+    if filter_data.get("req_boosted"):
+        boosts = pair.get("boosts")
+        active = (
+            _as_float(boosts.get("active"))
+            if isinstance(boosts, dict)
+            else None
+        )
+        if active is None or active < 1:
+            return False
 
     return True
 
@@ -1039,6 +1054,13 @@ async def _process_pairs(
     matches: list[dict[str, Any]] = []
 
     for pair in pairs:
+        if len(matches) >= MAX_ALERTS_PER_SCAN:
+            logger.info(
+                "Per-scan alert cap (%s) reached; deferring the rest",
+                MAX_ALERTS_PER_SCAN,
+            )
+            break
+
         if not _passes_core_filters(pair, filter_data):
             continue
 
@@ -1058,6 +1080,36 @@ async def _process_pairs(
 
         if already_sent:
             continue
+
+        # Re-validate against the authoritative pool snapshot.  A stale
+        # screener frame — or the promoted-token fallback, which is built from
+        # the aggregate token endpoint — can carry liquidity or market cap that
+        # DexScreener's own filters would reject.
+        if client is not None:
+            chain_id = str(pair.get("chainId") or "")
+            pair_address = str(pair.get("pairAddress") or "")
+            try:
+                snapshot = await _fetch_dex_pair_snapshot(
+                    client, chain_id, pair_address
+                )
+            except Exception:  # noqa: BLE001 - keep the screener value
+                snapshot = None
+                logger.warning(
+                    "Could not verify %s/%s; using screener data",
+                    chain_id,
+                    pair_address,
+                )
+
+            if snapshot is not None:
+                if not _passes_core_filters(snapshot, filter_data):
+                    logger.info(
+                        "Skipping %s: fails filters on the authoritative "
+                        "pair snapshot",
+                        token_address,
+                    )
+                    continue
+                # Fresher numbers for the alert itself.
+                pair = snapshot
 
         warning = fallback_warning
         if verify_with_gecko:
@@ -1119,37 +1171,38 @@ async def scan_dexscreener(
     )
 
     try:
-        try:
-            screener_pairs = await fetch_screener_pairs(filter_data)
-        except ScreenerUnavailable as exc:
-            logger.warning(
-                "DexScreener screener failed; falling back to profiles/boosts: %s",
-                exc,
-            )
-        except Exception:  # noqa: BLE001 - fallback must remain available
-            logger.exception(
-                "Unexpected DexScreener screener failure; using fallback"
-            )
-        else:
-            logger.info(
-                "DexScreener screener returned %s candidate pairs",
-                len(screener_pairs),
-            )
-            return await _process_pairs(
-                None,
-                screener_pairs,
-                filter_data,
-                telegram_id,
-                verify_with_gecko=False,
-                fallback_warning=None,
-            )
-
-        # Fallback: latest profiles + boosts through the public API.
         async with httpx.AsyncClient(
             timeout=REQUEST_TIMEOUT,
             headers={"User-Agent": USER_AGENT},
             follow_redirects=True,
         ) as client:
+            try:
+                screener_pairs = await fetch_screener_pairs(filter_data)
+            except ScreenerUnavailable as exc:
+                logger.warning(
+                    "DexScreener screener failed; falling back to "
+                    "profiles/boosts: %s",
+                    exc,
+                )
+            except Exception:  # noqa: BLE001 - fallback must remain available
+                logger.exception(
+                    "Unexpected DexScreener screener failure; using fallback"
+                )
+            else:
+                logger.info(
+                    "DexScreener screener returned %s candidate pairs",
+                    len(screener_pairs),
+                )
+                return await _process_pairs(
+                    client,
+                    screener_pairs,
+                    filter_data,
+                    telegram_id,
+                    verify_with_gecko=False,
+                    fallback_warning=None,
+                )
+
+            # Fallback: latest profiles + boosts through the public API.
             token_addresses = await _fetch_latest_token_addresses(client)
             pairs = await _fetch_pairs_by_addresses(client, token_addresses)
             logger.info(
