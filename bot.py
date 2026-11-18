@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
@@ -1195,15 +1196,13 @@ def _position_text(
 
     if stats:
         lines.extend(
-            [
-                "",
-                f"Invested: {_format_money(stats['invested'])}",
-                (
-                    f"Sold: {_format_quantity(stats['sold_quantity'])} "
-                    f"for {_format_money(stats['proceeds'])}"
-                ),
-            ]
+            ["", f"Invested: {_format_money(stats['invested'])}"]
         )
+        if stats["sold_quantity"] > 0:
+            lines.append(
+                f"Sold: {_format_quantity(stats['sold_quantity'])} "
+                f"for {_format_money(stats['proceeds'])}"
+            )
 
     lines.extend(
         [
@@ -1228,6 +1227,9 @@ def _position_text(
     )
     if current_price is None:
         lines.append("⚠️ Live price unavailable; last known price used.")
+    lines.extend(
+        ["", "Updated " + datetime.now(timezone.utc).strftime("%H:%M:%S UTC")]
+    )
     return "\n".join(lines)
 
 
@@ -1265,9 +1267,48 @@ def _position_keyboard(position: dict[str, Any]) -> InlineKeyboardMarkup:
         )
 
     rows.append(
-        [InlineKeyboardButton("« Portfolio", callback_data="paper:portfolio")]
+        [
+            InlineKeyboardButton(
+                "🔄 Refresh", callback_data=f"pf:pos:{position_id}"
+            ),
+            InlineKeyboardButton(
+                "« Portfolio", callback_data="paper:portfolio"
+            ),
+        ]
     )
     return InlineKeyboardMarkup(rows)
+
+
+async def _show_position(
+    query: Any, telegram_id: int, position_id: str
+) -> None:
+    """Render (or re-render) one position screen."""
+
+    position = await db.get_paper_position(position_id, telegram_id)
+    if (
+        position is None
+        or position.get("status") != "open"
+        or (_coerce_float(position.get("quantity")) or 0.0) <= 0
+    ):
+        await _safe_edit(query, "⚠️ That paper position is no longer open.")
+        return
+
+    price = await fetch_pair_price(
+        str(position.get("token_address") or ""),
+        str(position.get("chain_id") or ""),
+        str(position.get("pair_address") or ""),
+    )
+    try:
+        fills = await db.get_position_fills(telegram_id, position_id)
+    except Exception:  # noqa: BLE001 - the screen still works without it
+        logger.exception("Could not load fills for position %s", position_id)
+        fills = []
+
+    await _safe_edit(
+        query,
+        _position_text(position, price, fills),
+        _position_keyboard(position),
+    )
 
 
 async def _history_text(telegram_id: int) -> str:
@@ -1647,6 +1688,7 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
     prices = await fetch_current_prices(requests, references)
 
     sold = 0
+    fallback_sold = 0
     skipped: list[str] = []
     proceeds = 0.0
     realized = 0.0
@@ -1657,8 +1699,14 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
         )
         key = _price_key(position.get("chain_id"), position.get("pair_address"))
         price = prices.get(key)
+        used_last_price = False
         if price is None or price <= 0:
-            skipped.append(f"{symbol} — price unverified")
+            # Mirror the single-position sell: a pool DexScreener has dropped
+            # (dead token) can still be closed at its last known price.
+            price = _coerce_float(position.get("last_price_usd"))
+            used_last_price = True
+        if price is None or price <= 0:
+            skipped.append(f"{symbol} — no price available")
             continue
 
         try:
@@ -1683,6 +1731,8 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
             continue
 
         sold += 1
+        if used_last_price:
+            fallback_sold += 1
         proceeds += _coerce_float(fill.get("cash_amount_usd")) or 0.0
         realized += _coerce_float(fill.get("realized_pnl_usd")) or 0.0
 
@@ -1693,9 +1743,18 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
             "✅ Sell-all complete",
             "",
             f"Closed: {sold} position(s)",
-            f"Proceeds: {_format_money(proceeds)}",
-            f"Realized P&L: {_format_money(realized)}",
         ]
+        if fallback_sold:
+            lines.append(
+                f"At last known price: {fallback_sold} "
+                "(no live market for that pool)"
+            )
+        lines.extend(
+            [
+                f"Proceeds: {_format_money(proceeds)}",
+                f"Realized P&L: {_format_money(realized)}",
+            ]
+        )
 
     if skipped:
         lines.extend(["", f"Still open ({len(skipped)}):"])
@@ -1889,35 +1948,9 @@ async def _handle_paper_callback(
             )
             return
 
-        if data.startswith("paper:pos:"):
+        if data.startswith("paper:pos:") or data.startswith("pf:pos:"):
             position_id = data.split(":", 2)[2]
-            position = await db.get_paper_position(position_id, telegram_id)
-            if (
-                position is None
-                or position.get("status") != "open"
-                or (_coerce_float(position.get("quantity")) or 0.0) <= 0
-            ):
-                await _safe_edit(
-                    query, "⚠️ That paper position is no longer open."
-                )
-                return
-            price = await fetch_pair_price(
-                str(position.get("token_address") or ""),
-                str(position.get("chain_id") or ""),
-                str(position.get("pair_address") or ""),
-            )
-            try:
-                fills = await db.get_position_fills(telegram_id, position_id)
-            except Exception:  # noqa: BLE001 - the screen still works without it
-                logger.exception(
-                    "Could not load fills for position %s", position_id
-                )
-                fills = []
-            await _safe_edit(
-                query,
-                _position_text(position, price, fills),
-                _position_keyboard(position),
-            )
+            await _show_position(query, telegram_id, position_id)
             return
 
         if data.startswith("pb:"):
@@ -3028,17 +3061,32 @@ async def _handle_token_lookup(
         pair, status = await lookup_token(token_address)
     except Exception:  # noqa: BLE001 - a lookup must never crash the handler
         logger.exception("Token lookup crashed for %s", token_address)
-        await message.reply_text(
-            "⚠️ I could not look that token up. Please try again shortly."
-        )
-        return
+        pair, status = None, "error"
+
+    # The discovery endpoint occasionally hiccups; one retry avoids telling the
+    # user "no pair found" for a token that clearly exists.
+    if pair is None and status == "error":
+        await asyncio.sleep(0.7)
+        try:
+            pair, status = await lookup_token(token_address)
+        except Exception:  # noqa: BLE001
+            logger.exception("Token lookup retry crashed for %s", token_address)
+            pair, status = None, "error"
 
     if pair is None:
-        await message.reply_text(
-            "🔍 No DexScreener pair found for that address.\n\n"
-            "Make sure it is a token contract address — not a wallet, a pair "
-            "address, or a transaction signature."
-        )
+        if status == "error":
+            await message.reply_text(
+                "⚠️ DexScreener did not answer properly just now, so the "
+                "lookup failed. This is usually temporary — paste the "
+                "address again in a few seconds."
+            )
+        else:
+            await message.reply_text(
+                "🔍 No DexScreener pair found for that address.\n\n"
+                f"Address: {token_address}\n\n"
+                "Make sure it is a token contract address — not a wallet, a "
+                "pair address, or a transaction signature."
+            )
         return
 
     warning = None

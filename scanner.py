@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import time
+from collections import deque
 from typing import Any
 from urllib.parse import quote
 
@@ -63,9 +64,18 @@ PAIR_PRICE_CACHE_SECONDS = max(
 # Hard cap per pool so one slow provider cannot stall a whole sell-all.
 PRICE_LOOKUP_TIMEOUT = max(2.0, _env_float("PRICE_LOOKUP_TIMEOUT", 6.0))
 MAX_CONCURRENT_PRICE_REQUESTS = 4
+# GeckoTerminal's public API allows roughly 30 requests per minute.  Second
+# opinions are only requested for suspicious prices, but the budget is capped
+# so a burst of anomalies cannot burn the whole quota.
+GECKO_CALLS_PER_MINUTE = max(
+    1, int(_env_float("GECKO_CALLS_PER_MINUTE", 20))
+)
 
 # (chain, pair) -> (monotonic timestamp, price, status)
 _price_cache: dict[tuple[str, str], tuple[float, float | None, str]] = {}
+
+# Timestamps of recent GeckoTerminal calls, used to respect its rate limit.
+_gecko_calls: deque[float] = deque()
 
 GECKO_FAILURE_WARNING = (
     "⚠️ GeckoTerminal API failed. Buys/Sells unverified."
@@ -494,36 +504,6 @@ async def _fetch_gecko_price(
     return _as_float(attributes.get("base_token_price_usd"))
 
 
-async def _source_prices(
-    client: httpx.AsyncClient,
-    chain_id: str,
-    pair_address: str,
-) -> tuple[float | None, float | None]:
-    """Return ``(dexscreener_price, geckoterminal_price)`` independently."""
-
-    results = await asyncio.gather(
-        _fetch_dex_pair_price(client, chain_id, pair_address),
-        _fetch_gecko_price(client, chain_id, pair_address),
-        return_exceptions=True,
-    )
-
-    values: list[float | None] = []
-    for name, result in zip(("DexScreener", "GeckoTerminal"), results):
-        if isinstance(result, BaseException):
-            logger.warning(
-                "%s price lookup failed for %s/%s: %s: %s",
-                name,
-                chain_id,
-                pair_address,
-                type(result).__name__,
-                result,
-            )
-            values.append(None)
-        else:
-            values.append(result)
-    return values[0], values[1]
-
-
 def _combine_price_sources(
     dex_price: float | None,
     gecko_price: float | None,
@@ -556,7 +536,12 @@ def _is_unconfirmed_move(
     status: str,
     reference: Any,
 ) -> bool:
-    """Reject a single-source price that jumps far from the last known price."""
+    """Flag a single-source price that jumps far above the last known price.
+
+    Only upward jumps matter: they can fabricate profit and trip a
+    take-profit rule.  A crash is real information, and refusing it would make
+    a losing position impossible to value or sell.
+    """
 
     if price is None or status == "confirmed":
         return False
@@ -565,23 +550,60 @@ def _is_unconfirmed_move(
     if reference_price is None or reference_price <= 0:
         return False
 
-    ratio = price / reference_price
-    return ratio > PAIR_PRICE_JUMP_RATIO or ratio < 1 / PAIR_PRICE_JUMP_RATIO
+    return price > reference_price * PAIR_PRICE_JUMP_RATIO
+
+
+def _needs_second_source(
+    dex_price: float | None, reference: Any
+) -> bool:
+    """Return ``True`` when a GeckoTerminal second opinion is worth spending.
+
+    Ordinary quotes are accepted from the per-pair endpoint alone, which keeps
+    a 60-position portfolio at one request per pool.  GeckoTerminal is asked
+    only when the primary price is missing or looks suspiciously high.
+    """
+
+    if dex_price is None:
+        return True
+
+    reference_price = _as_float(reference)
+    if reference_price is None or reference_price <= 0:
+        return False
+
+    return dex_price > reference_price * PAIR_PRICE_JUMP_RATIO
+
+
+def _gecko_budget_available() -> bool:
+    """Consume one GeckoTerminal call from the per-minute budget."""
+
+    now = time.monotonic()
+    while _gecko_calls and now - _gecko_calls[0] >= 60.0:
+        _gecko_calls.popleft()
+    if len(_gecko_calls) >= GECKO_CALLS_PER_MINUTE:
+        return False
+    _gecko_calls.append(now)
+    return True
 
 
 async def resolve_prices(
     requests: list[tuple[str, str, str]],
+    references: dict[tuple[str, str], float | None] | None = None,
 ) -> dict[tuple[str, str], tuple[float | None, str]]:
     """Resolve prices for ``(token, chain, pair)`` requests.
 
-    Each distinct pool is queried once through DexScreener and once through
-    GeckoTerminal.  Results are cached briefly so a portfolio refresh and the
-    auto-sell pass in the same scan do not duplicate requests.
+    Each pool is priced through DexScreener's authoritative per-pair endpoint.
+    GeckoTerminal is consulted only for pools whose price is missing or
+    suspicious, so ordinary portfolios cost one request per pool instead of
+    two — which matters because Gecko's public API allows ~30 per minute.
+
+    Results are cached briefly so a portfolio refresh and the auto-sell pass in
+    the same scan do not duplicate requests.
     """
 
     if not requests:
         return {}
 
+    references = references or {}
     resolved: dict[tuple[str, str], tuple[float | None, str]] = {}
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_PRICE_REQUESTS)
 
@@ -601,17 +623,61 @@ async def resolve_prices(
 
             async with semaphore:
                 try:
-                    dex_price, gecko_price = await asyncio.wait_for(
-                        _source_prices(client, chain_id, pair_address),
+                    dex_price = await asyncio.wait_for(
+                        _fetch_dex_pair_price(
+                            client, chain_id, pair_address
+                        ),
                         timeout=PRICE_LOOKUP_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Price lookup timed out for %s/%s",
+                        "DexScreener price timed out for %s/%s",
                         chain_id,
                         pair_address,
                     )
-                    dex_price, gecko_price = None, None
+                    dex_price = None
+                except Exception as exc:  # noqa: BLE001 - degrade per pool
+                    logger.warning(
+                        "DexScreener price failed for %s/%s: %s: %s",
+                        chain_id,
+                        pair_address,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    dex_price = None
+
+                gecko_price: float | None = None
+                if _needs_second_source(dex_price, references.get(key)):
+                    if _gecko_budget_available():
+                        try:
+                            gecko_price = await asyncio.wait_for(
+                                _fetch_gecko_price(
+                                    client, chain_id, pair_address
+                                ),
+                                timeout=PRICE_LOOKUP_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "GeckoTerminal price timed out for %s/%s",
+                                chain_id,
+                                pair_address,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "GeckoTerminal price failed for %s/%s: %s: %s",
+                                chain_id,
+                                pair_address,
+                                type(exc).__name__,
+                                exc,
+                            )
+                    else:
+                        logger.warning(
+                            "GeckoTerminal budget exhausted; skipping "
+                            "corroboration for %s/%s",
+                            chain_id,
+                            pair_address,
+                        )
+
             price, status = _combine_price_sources(dex_price, gecko_price)
             _store_price(key, price, status)
             return key, (price, status)
@@ -639,15 +705,16 @@ async def fetch_current_prices(
     different prices in different pools.
 
     ``references`` maps a pool key to its last known price; a single-provider
-    price that moves more than ``PAIR_PRICE_JUMP_RATIO`` away from it is
-    discarded rather than used for a fill.
+    price that jumps above it by more than ``PAIR_PRICE_JUMP_RATIO`` is
+    discarded rather than used for a fill.  Downward moves are always
+    accepted — refusing them would freeze a crashing position.
     """
 
     if not requests:
         return {}
 
-    resolved = await resolve_prices(requests)
     references = references or {}
+    resolved = await resolve_prices(requests, references)
 
     prices: dict[tuple[str, str], float] = {}
     for _token, chain_id, pair_address in requests:
@@ -683,10 +750,10 @@ async def fetch_checked_pair_price(
     can explain a refusal to the user.
     """
 
-    resolved = await resolve_prices(
-        [(token_address, chain_id, pair_address)]
-    )
     key = _price_key(chain_id, pair_address)
+    resolved = await resolve_prices(
+        [(token_address, chain_id, pair_address)], {key: reference}
+    )
     price, status = resolved.get(key, (None, "no_price"))
 
     if _is_unconfirmed_move(price, status, reference):
@@ -760,6 +827,13 @@ async def lookup_token(
             follow_redirects=True,
         ) as client:
             pairs = await _fetch_pairs_by_addresses(client, [token_address])
+            if not pairs:
+                logger.info(
+                    "Token lookup for %s: DexScreener returned no pairs",
+                    token_address,
+                )
+                return None, "not_found"
+
             candidates = [
                 pair
                 for pair in pairs
@@ -768,6 +842,13 @@ async def lookup_token(
                 and str(pair.get("pairAddress") or "").strip()
             ]
             if not candidates:
+                # DexScreener also returns pools where this address is only the
+                # quote token; those prices belong to a different asset.
+                logger.info(
+                    "Token lookup for %s: %s pairs, none with it as base token",
+                    token_address,
+                    len(pairs),
+                )
                 return None, "not_found"
 
             candidates.sort(key=_pair_liquidity, reverse=True)
