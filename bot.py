@@ -31,8 +31,10 @@ from telegram.ext import (
 import database as db
 from scanner import (
     fetch_checked_pair_price,
+    fetch_checked_pair_quote,
     fetch_current_prices,
     fetch_pair_price,
+    fetch_pool_quotes,
     lookup_token,
     scan_dexscreener,
 )
@@ -87,6 +89,15 @@ PAPER_SLIPPAGE_BPS = min(
     5000, max(0, _env_int("PAPER_SLIPPAGE_BPS", 200))
 )
 PAPER_BUY_PRESETS = (25.0, 50.0, 100.0)
+
+# A paper exit larger than this share of the pool's depth is not credible:
+# on a real account it would fill far worse, or not fill at all.
+PAPER_MAX_EXIT_IMPACT_PCT = max(
+    1.0, min(90.0, _env_float("PAPER_MAX_EXIT_IMPACT_PCT", 20.0))
+)
+# Do not repeat the same "cannot exit" warning on every 60s scan.
+BLOCKED_EXIT_NOTICE_SECONDS = 3 * 60 * 60.0
+BLOCKED_EXIT_NOTICES: dict[tuple[int, str, int], float] = {}
 
 # user_id -> {"field": "<filters column>"}
 WAITING_FOR_VALUE: dict[int, dict[str, Any]] = {}
@@ -481,6 +492,41 @@ def _parse_usd_amount(
     if amount > maximum:
         return None, f"The maximum amount is ${maximum:,.2f}."
     return amount, None
+
+
+def _pool_impact(value_usd: float, liquidity_usd: float | None) -> float:
+    """Estimate price impact of trading ``value_usd`` against one pool.
+
+    Uses the constant-product relation with the quote side taken as half of
+    DexScreener's total liquidity, so impact = size / (size + quote reserve).
+    A $25 entry into a $600K pool is negligible; a $500 exit from a $3K pool
+    is not.
+    """
+
+    if value_usd <= 0:
+        return 0.0
+    if not liquidity_usd or liquidity_usd <= 0:
+        return 0.0
+    quote_reserve = liquidity_usd / 2.0
+    return value_usd / (value_usd + quote_reserve)
+
+
+def _fill_slippage_bps(
+    value_usd: float,
+    liquidity_usd: float | None,
+) -> tuple[int, float]:
+    """Return ``(slippage_bps, impact_fraction)`` for a paper fill."""
+
+    impact = _pool_impact(value_usd, liquidity_usd)
+    bps = PAPER_SLIPPAGE_BPS + int(round(impact * 10_000))
+    return min(5000, max(0, bps)), impact
+
+
+def _impact_note(impact: float) -> str:
+    return (
+        f"⚠️ Thin liquidity: this fill carries about {impact * 100:.0f}% "
+        "price impact."
+    )
 
 
 def _price_key(chain_id: Any, pair_address: Any) -> tuple[str, str]:
@@ -1082,6 +1128,25 @@ def _portfolio_keyboard(
             ]
         )
 
+    account = snapshot["account"]
+    auto_on = bool(account.get("auto_buy_enabled"))
+    auto_amount = _format_money(account.get("auto_buy_amount"))
+    rows.append(
+        [
+            InlineKeyboardButton(
+                (
+                    f"🤖 Auto-buy: ON · {auto_amount}"
+                    if auto_on
+                    else "🤖 Auto-buy: OFF — turn on"
+                ),
+                callback_data="paper:autobuy",
+            ),
+            InlineKeyboardButton(
+                "✏️ Amount", callback_data="paper:autobuy:amount"
+            ),
+        ]
+    )
+
     rows.append(
         [
             InlineKeyboardButton(
@@ -1439,7 +1504,7 @@ async def _execute_paper_buy(
         return False
 
     alert_price = _coerce_float(alert.get("price_usd"))
-    price, price_status = await fetch_checked_pair_price(
+    price, price_status, liquidity = await fetch_checked_pair_quote(
         str(alert.get("token_address") or ""),
         str(alert.get("chain_id") or ""),
         str(alert.get("pair_address") or ""),
@@ -1465,6 +1530,8 @@ async def _execute_paper_buy(
         )
         return False
 
+    slippage_bps, impact = _fill_slippage_bps(amount, liquidity)
+
     try:
         await _ensure_paper_account(telegram_id)
         fill = await db.execute_paper_buy(
@@ -1473,7 +1540,7 @@ async def _execute_paper_buy(
             amount,
             price,
             PAPER_FEE_RATE,
-            PAPER_SLIPPAGE_BPS,
+            slippage_bps,
         )
     except Exception as exc:  # noqa: BLE001 - user-facing failure
         await context.bot.send_message(
@@ -1494,6 +1561,8 @@ async def _execute_paper_buy(
     )
     if stale:
         text += "\n\n⚠️ Live price was unavailable; the alert price was used."
+    if impact > 0.02:
+        text += "\n\n" + _impact_note(impact)
 
     try:
         await context.bot.send_message(
@@ -1535,7 +1604,7 @@ async def _execute_paper_sell(
         return
 
     last_price = _coerce_float(position.get("last_price_usd"))
-    price, price_status = await fetch_checked_pair_price(
+    price, price_status, liquidity = await fetch_checked_pair_quote(
         str(position.get("token_address") or ""),
         str(position.get("chain_id") or ""),
         str(position.get("pair_address") or ""),
@@ -1561,6 +1630,10 @@ async def _execute_paper_sell(
         )
         return
 
+    quantity = _coerce_float(position.get("quantity")) or 0.0
+    sell_value = quantity * price * fraction
+    slippage_bps, impact = _fill_slippage_bps(sell_value, liquidity)
+
     try:
         fill = await db.execute_paper_sell(
             telegram_id,
@@ -1568,7 +1641,7 @@ async def _execute_paper_sell(
             fraction,
             price,
             PAPER_FEE_RATE,
-            PAPER_SLIPPAGE_BPS,
+            slippage_bps,
         )
     except Exception as exc:  # noqa: BLE001 - user-facing failure
         await context.bot.send_message(
@@ -1591,6 +1664,8 @@ async def _execute_paper_sell(
     )
     if stale:
         text += "\n\n⚠️ Live price was unavailable; the last known price was used."
+    if impact > 0.02:
+        text += "\n\n" + _impact_note(impact)
 
     await context.bot.send_message(
         chat_id=telegram_id,
@@ -1685,10 +1760,11 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
     }
     await _safe_edit(query, f"⏳ Selling {len(positions)} position(s)…")
 
-    prices = await fetch_current_prices(requests, references)
+    quotes = await fetch_pool_quotes(requests, references)
 
     sold = 0
     fallback_sold = 0
+    impacted = 0
     skipped: list[str] = []
     proceeds = 0.0
     realized = 0.0
@@ -1698,16 +1774,28 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
             position.get("symbol") or position.get("name") or "Token", 20
         )
         key = _price_key(position.get("chain_id"), position.get("pair_address"))
-        price = prices.get(key)
+        quote = quotes.get(key)
+        price: float | None = None
+        liquidity: float | None = None
+        if quote is not None:
+            price, liquidity = quote
+
         used_last_price = False
         if price is None or price <= 0:
             # Mirror the single-position sell: a pool DexScreener has dropped
             # (dead token) can still be closed at its last known price.
             price = _coerce_float(position.get("last_price_usd"))
             used_last_price = True
+            liquidity = None
         if price is None or price <= 0:
             skipped.append(f"{symbol} — no price available")
             continue
+
+        quantity = _coerce_float(position.get("quantity")) or 0.0
+        sell_value = quantity * price
+        slippage_bps, impact = _fill_slippage_bps(sell_value, liquidity)
+        if impact > 0.02:
+            impacted += 1
 
         try:
             fill = await db.execute_paper_sell(
@@ -1716,7 +1804,7 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
                 1.0,
                 price,
                 PAPER_FEE_RATE,
-                PAPER_SLIPPAGE_BPS,
+                slippage_bps,
             )
         except db.PaperTradingError as exc:
             skipped.append(f"{symbol} — {_clean_text(exc.message, 40)}")
@@ -1748,6 +1836,11 @@ async def _execute_sell_all(query: Any, telegram_id: int) -> None:
             lines.append(
                 f"At last known price: {fallback_sold} "
                 "(no live market for that pool)"
+            )
+        if impacted:
+            lines.append(
+                f"Heavy price impact: {impacted} position(s) — "
+                "thin liquidity, real exits would be worse"
             )
         lines.extend(
             [
@@ -1884,6 +1977,61 @@ async def _handle_paper_callback(
                     "This adds cash and is tracked as a deposit, not profit."
                 ),
                 {"action": "addfunds"},
+            )
+            return
+
+        if data == "paper:autobuy":
+            try:
+                account = await _ensure_paper_account(telegram_id)
+                if account.get("auto_buy_enabled"):
+                    await db.set_auto_buy(telegram_id, False)
+                    text = "🤖 Auto-buy disabled."
+                else:
+                    amount = (
+                        _coerce_float(account.get("auto_buy_amount"))
+                        or PAPER_BUY_PRESETS[0]
+                    )
+                    account = await db.set_auto_buy(
+                        telegram_id, True, amount
+                    )
+                    text = (
+                        "🤖 Auto-buy enabled.\n"
+                        "Amount per new alert: "
+                        f"{_format_money(account.get('auto_buy_amount'))}"
+                    )
+            except Exception as exc:  # noqa: BLE001 - user-facing failure
+                await context.bot.send_message(
+                    chat_id=telegram_id, text=_paper_error_text(exc)
+                )
+                return
+            await _safe_edit(
+                query,
+                text,
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "« Portfolio", callback_data="paper:portfolio"
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+        if data == "paper:autobuy:amount":
+            account = await _ensure_paper_account(telegram_id)
+            current = _format_money(account.get("auto_buy_amount"))
+            await _prompt_paper_input(
+                context,
+                telegram_id,
+                (
+                    "🤖 Auto-buy amount\n\n"
+                    f"Current: {current}\n"
+                    "Send the USD amount to spend on each new alert, "
+                    "for example: 25"
+                ),
+                {"action": "autobuy"},
             )
             return
 
@@ -2061,6 +2209,27 @@ async def _handle_paper_text(
             telegram_id,
             str(state["position_id"]),
             percent / 100.0,
+        )
+        return
+
+    if action == "autobuy":
+        amount, error = _parse_usd_amount(text)
+        if error:
+            await message.reply_text(
+                f"⚠️ {error}\n\nTry again, or send /cancel."
+            )
+            return
+        WAITING_FOR_PAPER_VALUE.pop(telegram_id, None)
+        try:
+            await _ensure_paper_account(telegram_id)
+            account = await db.set_auto_buy(telegram_id, True, amount)
+        except Exception as exc:  # noqa: BLE001
+            await message.reply_text(_paper_error_text(exc))
+            return
+        await message.reply_text(
+            "🤖 Auto-buy enabled.\n"
+            "Amount per new alert: "
+            f"{_format_money(account.get('auto_buy_amount'))}"
         )
         return
 
@@ -3270,12 +3439,67 @@ async def send_alert(
     )
 
 
+async def _notify_blocked_exit(
+    context: ContextTypes.DEFAULT_TYPE,
+    telegram_id: int,
+    position: dict[str, Any],
+    rule_id: int,
+    multiple: float,
+    sell_value: float,
+    liquidity: float | None,
+    impact: float,
+) -> None:
+    """Tell the user a take-profit cannot realistically fill (throttled)."""
+
+    key = (int(telegram_id), str(position.get("id")), int(rule_id))
+    now = time.monotonic()
+    if BLOCKED_EXIT_NOTICES.get(key, 0.0) > now:
+        return
+    BLOCKED_EXIT_NOTICES[key] = now + BLOCKED_EXIT_NOTICE_SECONDS
+
+    symbol = _clean_text(
+        position.get("symbol") or position.get("name") or "Token", 30
+    )
+    liquidity_text = (
+        _format_money(liquidity, compact=True) if liquidity else "unknown"
+    )
+    text = (
+        f"⚠️ Can't take profit: {symbol}\n\n"
+        f"Price reached {multiple:g}x, but this pool holds only about "
+        f"{liquidity_text} of liquidity.\n"
+        f"Exiting {_format_money(sell_value)} there would cost roughly "
+        f"{impact * 100:.0f}% in price impact — above your "
+        f"{PAPER_MAX_EXIT_IMPACT_PCT:g}% limit.\n\n"
+        "The paper position stays open. On a live account this exit would "
+        "fill far worse, or not fill at all."
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=int(telegram_id),
+            text=text,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "💼 View portfolio", callback_data="paper:portfolio"
+                        )
+                    ]
+                ]
+            ),
+        )
+    except TelegramError:
+        logger.exception(
+            "Could not send blocked-exit notice to %s", telegram_id
+        )
+
+
 async def _process_auto_sells(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> dict[str, int]:
     stats = {
         "auto_sells": 0,
         "auto_sell_errors": 0,
+        "auto_sell_blocked": 0,
         "price_unavailable": 0,
     }
 
@@ -3315,7 +3539,7 @@ async def _process_auto_sells(
         )
         for position in positions
     }
-    prices = await fetch_current_prices(requests, references)
+    quotes = await fetch_pool_quotes(requests, references)
 
     for position in positions:
         telegram_id = int(position["telegram_id"])
@@ -3324,9 +3548,14 @@ async def _process_auto_sells(
         if not user_rules:
             continue
 
-        current_price = prices.get(
+        quote = quotes.get(
             _price_key(position.get("chain_id"), position.get("pair_address"))
         )
+        if quote is None:
+            stats["price_unavailable"] += 1
+            continue
+
+        current_price, liquidity = quote
         if current_price is None or current_price <= 0:
             stats["price_unavailable"] += 1
             continue
@@ -3334,6 +3563,8 @@ async def _process_auto_sells(
         avg_entry = _coerce_float(position.get("avg_entry_price")) or 0.0
         if avg_entry <= 0:
             continue
+
+        position_quantity = _coerce_float(position.get("quantity")) or 0.0
 
         for rule in user_rules:
             rule_id = int(rule["id"])
@@ -3348,6 +3579,25 @@ async def _process_auto_sells(
             if current_price < avg_entry * multiple:
                 continue
 
+            # A take-profit only exists if the pool can absorb the exit at a
+            # believable price.  Without this, a paper account books profits
+            # that no live account could ever realise.
+            sell_value = position_quantity * current_price * (percent / 100.0)
+            slippage_bps, impact = _fill_slippage_bps(sell_value, liquidity)
+            if impact * 100.0 > PAPER_MAX_EXIT_IMPACT_PCT:
+                stats["auto_sell_blocked"] += 1
+                await _notify_blocked_exit(
+                    context,
+                    telegram_id,
+                    position,
+                    rule_id,
+                    multiple,
+                    sell_value,
+                    liquidity,
+                    impact,
+                )
+                continue
+
             try:
                 fill = await db.execute_paper_auto_sell(
                     telegram_id,
@@ -3355,7 +3605,7 @@ async def _process_auto_sells(
                     position_id,
                     current_price,
                     PAPER_FEE_RATE,
-                    PAPER_SLIPPAGE_BPS,
+                    slippage_bps,
                 )
             except db.PaperTradingError as exc:
                 if exc.code == "rule_already_triggered":
@@ -3391,12 +3641,15 @@ async def _process_auto_sells(
                 f"🎯 Auto-sell triggered: {symbol}\n\n"
                 f"Rule: {multiple:g}x · sell {percent:g}%\n"
                 f"Trigger price: {_format_price(current_price)}\n"
+                f"Pool liquidity: {_format_money(liquidity, compact=True)}\n"
                 f"Sold: {_format_quantity(fill.get('quantity'))}\n"
                 f"Proceeds: {_format_money(fill.get('cash_amount_usd'))}\n"
                 f"Fee: {_format_money(fill.get('fee_usd'))}\n"
                 f"Realized P&L: {_format_money(fill.get('realized_pnl_usd'))}\n"
                 f"Position: {'Closed' if status == 'closed' else 'Still open'}"
             )
+            if impact > 0.02:
+                text += "\n\n" + _impact_note(impact)
             try:
                 await context.bot.send_message(
                     chat_id=telegram_id,
@@ -3433,6 +3686,7 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
         "auto_buys": 0,
         "auto_sells": 0,
         "auto_sell_errors": 0,
+        "auto_sell_blocked": 0,
         "price_unavailable": 0,
         "errors": 0,
     }
@@ -3543,6 +3797,7 @@ async def trigger_scan(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
         auto_stats = await _process_auto_sells(context)
         stats["auto_sells"] = auto_stats["auto_sells"]
         stats["auto_sell_errors"] = auto_stats["auto_sell_errors"]
+        stats["auto_sell_blocked"] = auto_stats["auto_sell_blocked"]
         stats["price_unavailable"] = auto_stats["price_unavailable"]
     except Exception:  # noqa: BLE001 - do not fail the whole scan
         logger.exception("Auto-sell processing failed")

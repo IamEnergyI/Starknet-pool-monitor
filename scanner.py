@@ -72,7 +72,10 @@ GECKO_CALLS_PER_MINUTE = max(
 )
 
 # (chain, pair) -> (monotonic timestamp, price, status)
-_price_cache: dict[tuple[str, str], tuple[float, float | None, str]] = {}
+# (chain, pair) -> (monotonic timestamp, price, status, liquidity_usd)
+_price_cache: dict[
+    tuple[str, str], tuple[float, float | None, str, float | None]
+] = {}
 
 # Timestamps of recent GeckoTerminal calls, used to respect its rate limit.
 _gecko_calls: deque[float] = deque()
@@ -399,26 +402,29 @@ def _price_key(chain_id: Any, pair_address: Any) -> tuple[str, str]:
 
 def _cached_price(
     key: tuple[str, str],
-) -> tuple[float | None, str] | None:
+) -> tuple[float | None, str, float | None] | None:
     entry = _price_cache.get(key)
     if entry is None:
         return None
-    stored_at, price, status = entry
+    stored_at, price, status, liquidity = entry
     if (
         PAIR_PRICE_CACHE_SECONDS > 0
         and time.monotonic() - stored_at < PAIR_PRICE_CACHE_SECONDS
     ):
-        return price, status
+        return price, status, liquidity
     _price_cache.pop(key, None)
     return None
 
 
 def _store_price(
-    key: tuple[str, str], price: float | None, status: str
+    key: tuple[str, str],
+    price: float | None,
+    status: str,
+    liquidity: float | None,
 ) -> None:
     if PAIR_PRICE_CACHE_SECONDS <= 0:
         return
-    _price_cache[key] = (time.monotonic(), price, status)
+    _price_cache[key] = (time.monotonic(), price, status, liquidity)
 
 
 async def _fetch_dex_pair_snapshot(
@@ -588,8 +594,8 @@ def _gecko_budget_available() -> bool:
 async def resolve_prices(
     requests: list[tuple[str, str, str]],
     references: dict[tuple[str, str], float | None] | None = None,
-) -> dict[tuple[str, str], tuple[float | None, str]]:
-    """Resolve prices for ``(token, chain, pair)`` requests.
+) -> dict[tuple[str, str], tuple[float | None, str, float | None]]:
+    """Resolve ``(price, status, liquidity_usd)`` for each requested pool.
 
     Each pool is priced through DexScreener's authoritative per-pair endpoint.
     GeckoTerminal is consulted only for pools whose price is missing or
@@ -604,7 +610,9 @@ async def resolve_prices(
         return {}
 
     references = references or {}
-    resolved: dict[tuple[str, str], tuple[float | None, str]] = {}
+    resolved: dict[
+        tuple[str, str], tuple[float | None, str, float | None]
+    ] = {}
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_PRICE_REQUESTS)
 
     async with httpx.AsyncClient(
@@ -615,36 +623,42 @@ async def resolve_prices(
 
         async def resolve_one(
             chain_id: str, pair_address: str
-        ) -> tuple[tuple[str, str], tuple[float | None, str]]:
+        ) -> tuple[tuple[str, str], tuple[float | None, str, float | None]]:
             key = _price_key(chain_id, pair_address)
             cached = _cached_price(key)
             if cached is not None:
                 return key, cached
 
             async with semaphore:
+                snapshot: dict[str, Any] | None = None
                 try:
-                    dex_price = await asyncio.wait_for(
-                        _fetch_dex_pair_price(
+                    snapshot = await asyncio.wait_for(
+                        _fetch_dex_pair_snapshot(
                             client, chain_id, pair_address
                         ),
                         timeout=PRICE_LOOKUP_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "DexScreener price timed out for %s/%s",
+                        "DexScreener pair timed out for %s/%s",
                         chain_id,
                         pair_address,
                     )
-                    dex_price = None
                 except Exception as exc:  # noqa: BLE001 - degrade per pool
                     logger.warning(
-                        "DexScreener price failed for %s/%s: %s: %s",
+                        "DexScreener pair failed for %s/%s: %s: %s",
                         chain_id,
                         pair_address,
                         type(exc).__name__,
                         exc,
                     )
-                    dex_price = None
+
+                dex_price = (
+                    _as_float(snapshot.get("priceUsd")) if snapshot else None
+                )
+                liquidity = (
+                    _pair_liquidity(snapshot) if snapshot else None
+                )
 
                 gecko_price: float | None = None
                 if _needs_second_source(dex_price, references.get(key)):
@@ -679,8 +693,8 @@ async def resolve_prices(
                         )
 
             price, status = _combine_price_sources(dex_price, gecko_price)
-            _store_price(key, price, status)
-            return key, (price, status)
+            _store_price(key, price, status, liquidity)
+            return key, (price, status, liquidity)
 
         results = await asyncio.gather(
             *(
@@ -719,7 +733,9 @@ async def fetch_current_prices(
     prices: dict[tuple[str, str], float] = {}
     for _token, chain_id, pair_address in requests:
         key = _price_key(chain_id, pair_address)
-        price, status = resolved.get(key, (None, "no_price"))
+        price, status, _liquidity = resolved.get(
+            key, (None, "no_price", None)
+        )
         if price is None:
             continue
         if _is_unconfirmed_move(price, status, references.get(key)):
@@ -736,14 +752,53 @@ async def fetch_current_prices(
     return prices
 
 
-async def fetch_checked_pair_price(
+async def fetch_pool_quotes(
+    requests: list[tuple[str, str, str]],
+    references: dict[tuple[str, str], float | None] | None = None,
+) -> dict[tuple[str, str], tuple[float, float | None]]:
+    """Return trusted ``(price, liquidity_usd)`` per pool.
+
+    Same trust rules as :func:`fetch_current_prices`, but the pool's liquidity
+    travels with the price so callers can model exit impact instead of assuming
+    any size fills at the quoted price.
+    """
+
+    if not requests:
+        return {}
+
+    references = references or {}
+    resolved = await resolve_prices(requests, references)
+
+    quotes: dict[tuple[str, str], tuple[float, float | None]] = {}
+    for _token, chain_id, pair_address in requests:
+        key = _price_key(chain_id, pair_address)
+        price, status, liquidity = resolved.get(
+            key, (None, "no_price", None)
+        )
+        if price is None or price <= 0:
+            continue
+        if _is_unconfirmed_move(price, status, references.get(key)):
+            logger.warning(
+                "Discarding unconfirmed price for %s/%s: %.10g vs reference %.10g",
+                chain_id,
+                pair_address,
+                price,
+                _as_float(references.get(key)) or 0.0,
+            )
+            continue
+        quotes[key] = (price, liquidity)
+
+    return quotes
+
+
+async def fetch_checked_pair_quote(
     token_address: str,
     chain_id: str,
     pair_address: str,
     *,
     reference: float | None = None,
-) -> tuple[float | None, str]:
-    """Return ``(price, status)`` for one pool.
+) -> tuple[float | None, str, float | None]:
+    """Return ``(price, status, liquidity_usd)`` for one pool.
 
     ``status`` is one of ``confirmed``, ``single_source``,
     ``source_disagreement``, ``unconfirmed_move``, or ``no_price`` so callers
@@ -754,7 +809,7 @@ async def fetch_checked_pair_price(
     resolved = await resolve_prices(
         [(token_address, chain_id, pair_address)], {key: reference}
     )
-    price, status = resolved.get(key, (None, "no_price"))
+    price, status, liquidity = resolved.get(key, (None, "no_price", None))
 
     if _is_unconfirmed_move(price, status, reference):
         logger.warning(
@@ -764,8 +819,23 @@ async def fetch_checked_pair_price(
             price or 0.0,
             _as_float(reference) or 0.0,
         )
-        return None, "unconfirmed_move"
+        return None, "unconfirmed_move", liquidity
 
+    return price, status, liquidity
+
+
+async def fetch_checked_pair_price(
+    token_address: str,
+    chain_id: str,
+    pair_address: str,
+    *,
+    reference: float | None = None,
+) -> tuple[float | None, str]:
+    """Return ``(price, status)`` for one pool."""
+
+    price, status, _liquidity = await fetch_checked_pair_quote(
+        token_address, chain_id, pair_address, reference=reference
+    )
     return price, status
 
 
